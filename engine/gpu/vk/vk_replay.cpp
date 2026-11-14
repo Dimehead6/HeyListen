@@ -3209,10 +3209,13 @@ std::atomic<int> tl_active{0};
 int64_t tl_from = -2;
 int64_t tl_t0 = 0;
 inline int64_t tl_now() { return std::chrono::steady_clock::now().time_since_epoch().count(); }
+// RX_VK_TL=<present>, or RX_VK_TL_S=<seconds after the first present> (the window opens at the first present after that)
+int64_t tl_start_ns = 0;
 bool tl_wanted() {
     static const int64_t from = getenv("RX_VK_TL") ? atoll(getenv("RX_VK_TL")) : -1;
     tl_from = from;
-    return from >= 0;
+    if (getenv("RX_VK_TL_S")) tl_start_ns = tl_now() + (int64_t)(atof(getenv("RX_VK_TL_S")) * 1e9);
+    return from >= 0 || tl_start_ns;
 }
 inline void tl_ev(const char* what, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) {
     if (!tl_active.load(std::memory_order_relaxed)) return;
@@ -3226,6 +3229,7 @@ inline void tl_ev(const char* what, uint64_t a = 0, uint64_t b = 0, uint64_t c =
 void tl_at_present(int64_t presents) {
     static const bool want = tl_wanted();
     if (!want) return;
+    if (tl_start_ns && tl_now() >= tl_start_ns) tl_from = presents, tl_start_ns = 0;
     if (presents == tl_from && !tl_active.load()) tl_t0 = tl_now(), tl_n = 0, tl_active = 1;
     if (presents == tl_from + 3 && tl_active.load()) {
         tl_active = 0;
@@ -3885,7 +3889,7 @@ RbScope::~RbScope() {
     rb_prof_next = presents_now + 300;
 }
 void invalidate(uint64_t gpu, uint64_t size) {
-    static const bool rb_prof = getenv("RX_VK_RB_PROF") != nullptr || getenv("RX_VK_TL") != nullptr;
+    static const bool rb_prof = getenv("RX_VK_RB_PROF") != nullptr || getenv("RX_VK_TL") != nullptr || getenv("RX_VK_TL_S") != nullptr;
     RbScope rbs(rb_prof, gpu, size);
     // (HeyListen, TICK-059) RX_VK_READBACK_TICKET=1: the fast fence poll (wait_inner) no longer waits for the sync_order_mu
     // section in progress (a submit_q / present replay); it notes that section's number t (order_ticket_take) and the CPU's
