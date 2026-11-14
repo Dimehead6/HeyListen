@@ -3690,7 +3690,92 @@ bool tex_pages_any(uint64_t gpu, uint64_t size) {
 }
 void texture_created_of(const nvn_tex* t) { tex_pages_add(t, +1); }
 uint64_t fence();
+// ---- (stream R2) RX_VK_RB_PROF=1: every CPU read of GPU results (invalidate) timed by phase, and what it waited for, by the
+// thread that read and by range; a line every 300 presents. Phases: 0 the ticket's wait for the replay section in progress
+// (or the order lock), 1 the catch-up of a replay behind, 2 the wait for the recording the write-back's submission is in
+// (the replay reaching it), 3 the wait on the GPU's timeline, 4 the strict wait, 5 the catch-up for textures the GPU wrote
+// and their texels into memory. Logging only
+struct RbScope {
+    bool on;
+    uint64_t gpu, size;
+    int64_t t0 = 0, ph[6] = {0, 0, 0, 0, 0, 0}, pt = 0;
+    bool ever = false, pending = false, newest = false;
+    uint64_t value = 0, fence_at = 0;
+    explicit RbScope(bool o, uint64_t g, uint64_t s) : on(o), gpu(g), size(s) { if (on) t0 = pt = now_ns(); }
+    static int64_t now_ns() { return std::chrono::steady_clock::now().time_since_epoch().count(); }
+    void mark(int p) { if (!on) return; const int64_t t = now_ns(); ph[p] += t - pt; pt = t; }
+    void skip() { if (on) pt = now_ns(); }   // (time not charged to a phase)
+    ~RbScope();
+};
+const char* rb_thread_label() {
+    thread_local char name[40];
+    thread_local bool have = false;
+    if (!have) {
+        have = true;
+        snprintf(name, sizeof name, "tid%lu", (unsigned long)GetCurrentThreadId());
+        typedef HRESULT(WINAPI * GetDesc)(HANDLE, PWSTR*);
+        const GetDesc gd = (GetDesc)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+        PWSTR w = nullptr;
+        if (gd && SUCCEEDED(gd(GetCurrentThread(), &w)) && w) {
+            char u[40]{};
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u - 1, nullptr, nullptr);
+            if (u[0]) snprintf(name, sizeof name, "%s", u);
+            LocalFree(w);
+        }
+    }
+    return name;
+}
+struct RbAgg {
+    int64_t calls = 0, ever = 0, pending = 0, newest = 0, ns_total = 0, ph[6] = {0, 0, 0, 0, 0, 0}, ns_max = 0;
+    void add(const RbScope& s, int64_t total) {
+        calls++, ever += s.ever, pending += s.pending, newest += s.newest, ns_total += total;
+        for (int i = 0; i < 6; i++) ph[i] += s.ph[i];
+        ns_max = std::max(ns_max, total);
+    }
+};
+std::mutex rb_prof_mu;
+std::map<std::pair<uint64_t, uint64_t>, RbAgg> rb_prof_ranges;
+std::map<std::string, RbAgg> rb_prof_threads;
+RbAgg rb_prof_all;
+int64_t rb_prof_next = 300, rb_prof_from = 0;
+RbScope::~RbScope() {
+    if (!on) return;
+    const int64_t total = now_ns() - t0;
+    std::lock_guard lk(rb_prof_mu);
+    if (!rb_prof_from) rb_prof_from = presents_now, rb_prof_next = presents_now + 300;   // (the first window starts here)
+    rb_prof_all.add(*this, total);
+    rb_prof_threads[rb_thread_label()].add(*this, total);
+    if (rb_prof_ranges.size() < 512 || rb_prof_ranges.count({gpu, size})) rb_prof_ranges[{gpu, size}].add(*this, total);
+    if (presents_now < rb_prof_next) return;
+    const int64_t frames = std::max<int64_t>(1, presents_now - rb_prof_from);
+    static int logged = 0;
+    if (logged++ < 200) {
+        auto line = [&](const char* what, const RbAgg& a) {
+            logf("vk: rbprof %lld presents %s: %.1f calls/frame (%.1f with write-backs, %.1f pending, %.1f newest), %.2f ms/frame "
+                 "[ticket %.2f, catchup %.2f, recorded %.2f, gpu %.2f, strict %.2f, textures %.2f], max %.2f ms",
+                 (long long)frames, what, a.calls / (double)frames, a.ever / (double)frames, a.pending / (double)frames,
+                 a.newest / (double)frames, a.ns_total / 1e6 / frames, a.ph[0] / 1e6 / frames, a.ph[1] / 1e6 / frames,
+                 a.ph[2] / 1e6 / frames, a.ph[3] / 1e6 / frames, a.ph[4] / 1e6 / frames, a.ph[5] / 1e6 / frames, a.ns_max / 1e6);
+        };
+        line("all", rb_prof_all);
+        for (const auto& t : rb_prof_threads) line(t.first.c_str(), t.second);
+        std::vector<std::pair<std::pair<uint64_t, uint64_t>, RbAgg>> v(rb_prof_ranges.begin(), rb_prof_ranges.end());
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.ns_total > b.second.ns_total; });
+        for (size_t i = 0; i < v.size() && i < 12; i++) {
+            char nm[64];
+            snprintf(nm, sizeof nm, "range %#llx +%#llx", (unsigned long long)v[i].first.first, (unsigned long long)v[i].first.second);
+            line(nm, v[i].second);
+        }
+    }
+    rb_prof_all = RbAgg();
+    rb_prof_threads.clear();
+    rb_prof_ranges.clear();
+    rb_prof_from = presents_now;
+    rb_prof_next = presents_now + 300;
+}
 void invalidate(uint64_t gpu, uint64_t size) {
+    static const bool rb_prof = getenv("RX_VK_RB_PROF") != nullptr;
+    RbScope rbs(rb_prof, gpu, size);
     // (HeyListen, TICK-059) RX_VK_READBACK_TICKET=1: the fast fence poll (wait_inner) no longer waits for the sync_order_mu
     // section in progress (a submit_q / present replay); it notes that section's number t (order_ticket_take) and the CPU's
     // readback here waits until section t has left, before anything else it does. Why that is all the locked path gave it:
@@ -3715,7 +3800,9 @@ void invalidate(uint64_t gpu, uint64_t size) {
     // (TICK-058's v3 waited at every readback with write-backs for whichever replay was in progress then: castle-move -6 fps)
     const int ticket = readback_ticket();
     if (size && ticket == 1) order_ticket_wait();
+    rbs.mark(0);
     if (size) memory_cpu_reads(host->gpu_guest(gpu), size);   // (TICK-015: its pool's write-backs made from now on)
+    rbs.skip();
     static const bool log_inv = getenv("RX_VK_LOG_INVALIDATE") != nullptr;
     static std::atomic<int> logged{0};
     if (log_inv && logged++ < 400) {
@@ -3757,12 +3844,15 @@ void invalidate(uint64_t gpu, uint64_t size) {
             // registrations, the order the poll's lock gave. (Every invalidate waiting cost the main thread and the module
             // workers 1.2-1.8 ms a frame each: most ranges have no write-backs.)
             // (TICK-059) with RX_VK_READBACK_TICKET the ticket's wait above replaces this one (=2: here, a diagnostic)
+            rbs.ever = true;
+            rbs.skip();
             if (ticket == 2) order_ticket_wait();
             else if (!ticket && fence_poll_fast_on() && !async_on() && sync_waits_on() && !per_queue_fences_off()) {
                 jt_mark(36, 0);   // (36/37: the readback waiting for the replay in progress)
                 { std::lock_guard lk(sync_order_mu); }
                 jt_mark(37, 0);
             }
+            rbs.mark(0);
             memory_note_readback(host->gpu_guest(gpu), size);   // (PR 430: the CPU may write it back: memory_rb_refresh)
             static std::atomic<int64_t> calls{0}, waited{0}, ns{0};
             const auto w0 = std::chrono::steady_clock::now();
@@ -3776,20 +3866,31 @@ void invalidate(uint64_t gpu, uint64_t size) {
             // exposure readbacks). The write-back is waited for on the recordings' timeline instead, which a stopped queue
             // does not hold back
             const bool unforced = !async_on() && sync_waits_on() && !per_queue_fences_off();
+            rbs.skip();
             if (behind0 && !no_catchup && !unforced) wait_queue_empty(), w = true;   // (work handed over may write it back too)
+            rbs.mark(1);
             const auto w1 = std::chrono::steady_clock::now();
             const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);
+            rbs.value = v, rbs.fence_at = f0;
+            rbs.skip();
             if (v > completed()) {
+                rbs.pending = true, rbs.newest = v >= f0;
+                rbs.skip();
                 int ok = 0;
                 if (!(unforced && wait_recorded(v, UINT64_MAX, &ok))) {
+                    rbs.mark(2);
                     if (unforced && replay_behind()) wait_queue_empty();   // (not recorded whole: as before)
+                    rbs.mark(1);
                     wait_value(v);
-                }
+                    rbs.mark(3);
+                } else
+                    rbs.mark(2);
                 // (sprint 5, RX_VK_READBACK_STRICT: the value itself reached on the GPU's timeline before the CPU reads)
                 static const bool strict = readback_strict_on();
                 static std::atomic<int64_t> st_strict{0};
                 if (strict && v > completed()) {
                     wait_value(v);
+                    rbs.mark(4);
                     if (st_strict.fetch_add(1) % 500 == 0) logf("vk: readback strict: %lld waits for the value past the recordings' timeline", (long long)st_strict.load());
                 }
                 w = true;
@@ -3848,6 +3949,8 @@ void invalidate(uint64_t gpu, uint64_t size) {
     // (hookshot) and on the submitting thread's replay, the catch-up lets on what may go without forcing anything past its wait
     // (once the exposure readback above no longer did, this one forced OoT's presentation work on, every frame or two)
     const bool unforced = !async_on() && sync_waits_on() && !per_queue_fences_off();
+    rbs.skip();
+    struct Tex5 { RbScope& r; ~Tex5() { r.mark(5); } } tex5{rbs};
     if (!texture_gpu_written_in(gpu, size)) {
         if (!replay_behind()) return;
         if (!always && !tex_pages_any(gpu, size)) return;   // (no texture's storage there: buffers only)
