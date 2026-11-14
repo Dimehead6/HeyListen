@@ -3182,6 +3182,56 @@ uint64_t replay_pin_mask() {
 #endif
 }
 thread_local int replay_pin_depth = 0;
+// ---- (stream R2) RX_VK_TL=<present>: a timeline of what the renderer's threads do over 3 frames from that present on (threads by
+// name, times in ms from the window's start): the submits and their replays, the CPU's event signals, the stops at event
+// waits, the presents and their drains, the fence waits, the readbacks with their waits. Logging only ----
+const char* rb_thread_label();
+struct TlEv {
+    int64_t t;
+    const char* what;
+    uint64_t a, b, c;
+    char thread[24];
+};
+constexpr uint32_t kTlMax = 1 << 15;
+TlEv tl_ring[kTlMax];
+std::atomic<uint32_t> tl_n{0};
+std::atomic<int> tl_active{0};
+int64_t tl_from = -2;
+int64_t tl_t0 = 0;
+inline int64_t tl_now() { return std::chrono::steady_clock::now().time_since_epoch().count(); }
+bool tl_wanted() {
+    static const int64_t from = getenv("RX_VK_TL") ? atoll(getenv("RX_VK_TL")) : -1;
+    tl_from = from;
+    return from >= 0;
+}
+inline void tl_ev(const char* what, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) {
+    if (!tl_active.load(std::memory_order_relaxed)) return;
+    const uint32_t i = tl_n.fetch_add(1);
+    if (i >= kTlMax) return;
+    TlEv& e = tl_ring[i];
+    e.t = tl_now(), e.what = what, e.a = a, e.b = b, e.c = c;
+    snprintf(e.thread, sizeof e.thread, "%s", rb_thread_label());
+}
+/// at the top of a present: opens the window at present `from`, writes it out 3 presents later
+void tl_at_present(int64_t presents) {
+    static const bool want = tl_wanted();
+    if (!want) return;
+    if (presents == tl_from && !tl_active.load()) tl_t0 = tl_now(), tl_n = 0, tl_active = 1;
+    if (presents == tl_from + 3 && tl_active.load()) {
+        tl_active = 0;
+        const uint32_t n = std::min<uint32_t>(tl_n.load(), kTlMax);
+        std::vector<uint32_t> ord(n);
+        for (uint32_t i = 0; i < n; i++) ord[i] = i;
+        std::sort(ord.begin(), ord.end(), [](uint32_t a, uint32_t b) { return tl_ring[a].t < tl_ring[b].t; });
+        logf("vk: tl begin (%u events from present %lld)", n, (long long)tl_from);
+        for (uint32_t i : ord) {
+            const TlEv& e = tl_ring[i];
+            logf("vk: tl %9.3f %-22s %-14s %#llx %#llx %#llx", (e.t - tl_t0) / 1e6, e.thread, e.what, (unsigned long long)e.a,
+                 (unsigned long long)e.b, (unsigned long long)e.c);
+        }
+        logf("vk: tl end");
+    }
+}
 thread_local DWORD_PTR replay_pin_prev = 0;
 struct ReplayPin {
     bool counted = false;
@@ -3204,7 +3254,10 @@ struct ReplayPin {
 /// memory_work: its memory work first (else done as it came)
 bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, bool memory_work, int cb = 0,
                 const uint8_t* p = nullptr, bool may_stop = false) {
+    tl_ev("run+", value, queue, cb);
     std::lock_guard lk(replay_mu);
+    tl_ev("run-locked", value);
+    struct TlRun { uint64_t v; ~TlRun() { tl_ev("run-", v); } } tl_run{value};
     ReplayPin pin;
     SlowWatch slow("submit");
     PROF(PROF_SUBMIT);
@@ -3237,6 +3290,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         if (stop) break;
     }
     if (stop) {
+        tl_ev("stop", value, queue, wait_at(stop).gpu);
         QueueRun& q = qruns[queue];
         q.waiting = true;
         q.handles.assign(handles, handles + n);
@@ -3425,10 +3479,12 @@ void sync_watch() {
         if (!blocked_n.load()) continue;
         std::unique_lock lk(sync_order_mu, std::try_to_lock);
         if (!lk) continue;
+        tl_ev("watch+");
         burst_begin(0);   // (a signal from the CPU the thread that made it could not act on)
         schedule();
         burst_end();
         update_blocked();
+        tl_ev("watch-");
         const double held = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - blocked_since).count();
         if (blocked_n.load() && held > hold_ms()) {
             drain(3);
@@ -3508,7 +3564,9 @@ int wait_core(uint64_t f, uint64_t timeout_ns) {
     const int blocked0 = (int)blocked_n.load();
     const auto t0 = std::chrono::steady_clock::now();
     wait_path = 0;
+    tl_ev("fence-wait+", f, timeout_ns);
     const int r = wait_inner(f, timeout_ns);
+    tl_ev("fence-wait-", f, (uint64_t)wait_path);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     static std::mutex mu;
     static int64_t n, n_long, by_path[4], unrec, logged;
@@ -3766,6 +3824,9 @@ int64_t rb_prof_next = 300, rb_prof_from = 0;
 RbScope::~RbScope() {
     if (!on) return;
     const int64_t total = now_ns() - t0;
+    if (tl_active.load(std::memory_order_relaxed)) {
+        tl_ev("rb-end", gpu, size, (uint64_t)(total / 1000) | (uint64_t)(ph[2] / 1000) << 24 | (uint64_t)(ph[3] / 1000) << 40 | (uint64_t)late << 63);
+    }
     std::lock_guard lk(rb_prof_mu);
     if (!rb_prof_from) rb_prof_from = presents_now, rb_prof_next = presents_now + 300;   // (the first window starts here)
     rb_prof_all.add(*this, total);
@@ -5740,8 +5801,11 @@ bool replay_behind() {
 
 std::mutex submit_order_mu;   // (captures and submits queued in the same order)
 void submit_q(const uint64_t* handles, int n, uint64_t queue) {
+    tl_ev("submit+", queue, n);
+    struct TlSub { ~TlSub() { tl_ev("submit-"); } } tl_sub;
     if (!async_on()) {
         std::lock_guard order(sync_order_mu);
+        tl_ev("submit-locked");
         ReplayPin pin;   // (the capture and the replay on the replay's core)
         // (the replay here is on the submitting thread, but the game's other threads go on writing their next frames: a pool
         // synced from guest memory later in the frame read those. The capture is taken here too)
@@ -5752,7 +5816,9 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
         static const bool capture = !getenv("RX_VK_SYNC_CAPTURE") || atoi(getenv("RX_VK_SYNC_CAPTURE")) != 0;
         jt_mark(11, 0);
         lag_bq_enter();   // (RX_VK_LAG_LOG)
+        tl_ev("capture+");
         if (capture) memory_capture_submit();
+        tl_ev("capture-");
         jt_mark(12, 0);
         // (RX_VK_SUBMIT_DELAY_US=<us> (a test): a console's GPU starts later than this replay does. Does what a submission reads
         // arrive just after it, from the game's other threads?)
@@ -5789,15 +5855,21 @@ void submit(const uint64_t* handles, int n) {
     submit_q(handles, n, 0);
 }
 void present(const nvn_tex* t, const int crop[4]) {
+    tl_at_present(presents_now);
+    tl_ev("present+");
+    struct TlPres { ~TlPres() { tl_ev("present-"); } } tl_pres;
     lag_present();   // (RX_VK_LAG_LOG)
     if (lag_on() && presents % 600 == 0) log_order_stats();
     memory_precopy_present();
     memory_cap_present();
     if (!async_on()) {
+        tl_ev("present-wait-lock");
         std::lock_guard order(sync_order_mu);
+        tl_ev("present-locked");
         ReplayPin pin;   // (the frame's last replays and the present on the replay's core)
         if (sync_waits_on()) {
             drain(0);   // (the frame's work whole before it is shown)
+            tl_ev("present-drained");
             update_blocked();
             present_value = ++q_values;
             if (ubo_check_on()) ubo_check_frame();
@@ -5875,6 +5947,7 @@ void register_texture_queued(int id, const nvn_tex* t, const nvn_view* v) {
     enqueue(std::move(j));
 }
 void event_signal_queued(uint64_t gpu, uint32_t value) {
+    tl_ev("cpu-signal", gpu, value);
     if (!async_on()) {
         std::lock_guard lk(ev_cpu_mu);
         ev_cpu_pending.emplace_back(gpu, value);
