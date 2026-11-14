@@ -53,6 +53,7 @@
 
 #include "vk_internal.h"
 #include "vk_lag.h"   // (RX_VK_LAG_LOG)
+#include "readback_late.h"   // (RX_VK_READBACK_LATE)
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
@@ -3695,11 +3696,22 @@ uint64_t fence();
 // (or the order lock), 1 the catch-up of a replay behind, 2 the wait for the recording the write-back's submission is in
 // (the replay reaching it), 3 the wait on the GPU's timeline, 4 the strict wait, 5 the catch-up for textures the GPU wrote
 // and their texels into memory. Logging only
+/// (stream R2, RX_VK_READBACK_LATE, readback_late.h) whether a readback of that size, written by the newest submission handed
+/// out or not, is read without its wait. Off unless the switch names a rule
+bool readback_late_wanted(uint64_t size, bool newest) {
+    static const readback_late::Rules rules = [] {
+        const char* e = getenv("RX_VK_READBACK_LATE");
+        const readback_late::Rules r = readback_late::parse(e);
+        if (r.any()) logf("vk: readbacks read without their wait: RX_VK_READBACK_LATE=%s (newest %d, %d sizes, %d never)", e, (int)r.newest, (int)r.sizes.size(), (int)r.never.size());
+        return r;
+    }();
+    return readback_late::wanted(rules, size, newest);
+}
 struct RbScope {
     bool on;
     uint64_t gpu, size;
     int64_t t0 = 0, ph[6] = {0, 0, 0, 0, 0, 0}, pt = 0;
-    bool ever = false, pending = false, newest = false;
+    bool ever = false, pending = false, newest = false, late = false;
     uint64_t value = 0, fence_at = 0;
     char site[80] = "";   // (the exe's frames above the renderer: the guest function that asked, by its address in the exe's map)
     explicit RbScope(bool o, uint64_t g, uint64_t s) : on(o), gpu(g), size(s) {
@@ -3739,9 +3751,9 @@ const char* rb_thread_label() {
     return name;
 }
 struct RbAgg {
-    int64_t calls = 0, ever = 0, pending = 0, newest = 0, ns_total = 0, ph[6] = {0, 0, 0, 0, 0, 0}, ns_max = 0;
+    int64_t calls = 0, ever = 0, pending = 0, newest = 0, late = 0, ns_total = 0, ph[6] = {0, 0, 0, 0, 0, 0}, ns_max = 0;
     void add(const RbScope& s, int64_t total) {
-        calls++, ever += s.ever, pending += s.pending, newest += s.newest, ns_total += total;
+        calls++, ever += s.ever, pending += s.pending, newest += s.newest, late += s.late, ns_total += total;
         for (int i = 0; i < 6; i++) ph[i] += s.ph[i];
         ns_max = std::max(ns_max, total);
     }
@@ -3769,10 +3781,10 @@ RbScope::~RbScope() {
     static int logged = 0;
     if (logged++ < 200) {
         auto line = [&](const char* what, const RbAgg& a) {
-            logf("vk: rbprof %lld presents %s: %.1f calls/frame (%.1f with write-backs, %.1f pending, %.1f newest), %.2f ms/frame "
+            logf("vk: rbprof %lld presents %s: %.1f calls/frame (%.1f with write-backs, %.1f pending, %.1f newest, %.1f late), %.2f ms/frame "
                  "[ticket %.2f, catchup %.2f, recorded %.2f, gpu %.2f, strict %.2f, textures %.2f], max %.2f ms",
                  (long long)frames, what, a.calls / (double)frames, a.ever / (double)frames, a.pending / (double)frames,
-                 a.newest / (double)frames, a.ns_total / 1e6 / frames, a.ph[0] / 1e6 / frames, a.ph[1] / 1e6 / frames,
+                 a.newest / (double)frames, a.late / (double)frames, a.ns_total / 1e6 / frames, a.ph[0] / 1e6 / frames, a.ph[1] / 1e6 / frames,
                  a.ph[2] / 1e6 / frames, a.ph[3] / 1e6 / frames, a.ph[4] / 1e6 / frames, a.ph[5] / 1e6 / frames, a.ns_max / 1e6);
         };
         line("all", rb_prof_all);
@@ -3897,9 +3909,12 @@ void invalidate(uint64_t gpu, uint64_t size) {
             const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);
             rbs.value = v, rbs.fence_at = f0;
             rbs.skip();
-            if (v > completed()) {
-                rbs.pending = true, rbs.newest = v >= f0;
-                rbs.skip();
+            // (RX_VK_READBACK_LATE: a range a rule names is read as guest memory holds it, with no wait at all)
+            const bool pend = v > completed();
+            const bool late = pend && readback_late_wanted(size, v >= f0);
+            if (pend) rbs.pending = true, rbs.newest = v >= f0, rbs.late = late;
+            rbs.skip();
+            if (pend && !late) {
                 int ok = 0;
                 if (!(unforced && wait_recorded(v, UINT64_MAX, &ok))) {
                     rbs.mark(2);
