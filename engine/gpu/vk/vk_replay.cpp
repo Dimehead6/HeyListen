@@ -3838,6 +3838,8 @@ RbScope::~RbScope() {
     if (tl_active.load(std::memory_order_relaxed)) {
         tl_ev("rb-end", gpu, size, (uint64_t)(total / 1000) | (uint64_t)(ph[2] / 1000) << 24 | (uint64_t)(ph[3] / 1000) << 40 | (uint64_t)late << 63);
     }
+    static const bool aggregate = getenv("RX_VK_RB_PROF") != nullptr;
+    if (!aggregate) return;
     std::lock_guard lk(rb_prof_mu);
     if (!rb_prof_from) rb_prof_from = presents_now, rb_prof_next = presents_now + 300;   // (the first window starts here)
     rb_prof_all.add(*this, total);
@@ -3882,7 +3884,7 @@ RbScope::~RbScope() {
     rb_prof_next = presents_now + 300;
 }
 void invalidate(uint64_t gpu, uint64_t size) {
-    static const bool rb_prof = getenv("RX_VK_RB_PROF") != nullptr;
+    static const bool rb_prof = getenv("RX_VK_RB_PROF") != nullptr || getenv("RX_VK_TL") != nullptr;
     RbScope rbs(rb_prof, gpu, size);
     // (HeyListen, TICK-059) RX_VK_READBACK_TICKET=1: the fast fence poll (wait_inner) no longer waits for the sync_order_mu
     // section in progress (a submit_q / present replay); it notes that section's number t (order_ticket_take) and the CPU's
