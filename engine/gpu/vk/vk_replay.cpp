@@ -788,6 +788,16 @@ std::unordered_map<uint64_t, uint32_t> ev_values;
 std::mutex ev_cpu_mu;
 std::vector<std::pair<uint64_t, uint32_t>> ev_cpu_pending;
 std::atomic<bool> ev_cpu_any{false};
+// (stream R2) RX_VK_WATCH_KICK=1: the CPU's event signal wakes the order thread (sync_watch) at once, instead of its Sleep(1)
+// finding the signal up to ~1-2 ms later (timer resolution 1 ms). Off: as before
+HANDLE watch_kick_event() {
+    static HANDLE h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    return h;
+}
+bool watch_kick_on() {
+    static const bool v = getenv("RX_VK_WATCH_KICK") && atoi(getenv("RX_VK_WATCH_KICK")) != 0;
+    return v;
+}
 std::unordered_set<uint64_t> cpu_events;   // (events the CPU has signalled, nvnEventSignal; ev_cpu_mu)
 void ev_cpu_apply() {
     if (!ev_cpu_any.load(std::memory_order_acquire)) return;
@@ -3475,7 +3485,8 @@ void sync_settle() {
 void sync_watch() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk order");
     for (;;) {
-        Sleep(1);
+        if (watch_kick_on()) WaitForSingleObject(watch_kick_event(), 1);
+        else Sleep(1);
         if (!blocked_n.load()) continue;
         std::unique_lock lk(sync_order_mu, std::try_to_lock);
         if (!lk) continue;
@@ -5952,6 +5963,7 @@ void event_signal_queued(uint64_t gpu, uint32_t value) {
         std::lock_guard lk(ev_cpu_mu);
         ev_cpu_pending.emplace_back(gpu, value);
         ev_cpu_any.store(true, std::memory_order_release);
+        if (watch_kick_on()) SetEvent(watch_kick_event());
         return;   // (sync_watch or the next submit lets the stopped ones on: not this thread, ~1.7 ms a frame of the critical path)
     }
     Job j{JOB_EVENT_SIGNAL};
