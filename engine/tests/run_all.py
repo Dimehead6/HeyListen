@@ -136,6 +136,7 @@ ARGS = {
     "nx2/test_spirv_struct_identity.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "tests/test_astc_bc_policy.py": ["--cxx", "g++"],
     "tests/test_drawn_page_map.py": ["--cxx", "{cxx}"],
+    "tests/test_evict_reason.py": ["--cxx", "{cxx}"],
 }
 
 # Python packages some tests import (CI installs them; the runner itself needs none)
