@@ -98,7 +98,7 @@ const char* rb_thread_label() {
 // waits, the presents and their drains, the fence waits, the readbacks with their waits. Logging only ----
 // (RX_VK_RB_PROF: what wait_recorded spent, by this thread since the readback began: the flush's wait (the pending late fix and the
 // queue's lock), the recordings' timeline, and the readbacks whose recording was not known yet)
-thread_local int64_t rb_wr_ns[2] = {0, 0}, rb_wr_miss = 0;
+thread_local int64_t rb_wr_ns[2] = {0, 0}, rb_wr_miss = 0, rb_fl_ns[3] = {0, 0, 0};   // (queue_flush_for: the late fix's wait, the queue's lock, the flush)
 struct TlEv {
     int64_t t;
     const char* what;
@@ -494,10 +494,14 @@ void device_wait_idle_locked() {   // (dev.present_mu held)
 }
 namespace {
 void queue_flush_for(int why) {
+    const int64_t f0 = std::chrono::steady_clock::now().time_since_epoch().count();
     if (!late_fix_wait_unlocked()) return;   // (TICK-060: a poll while a fix waits: nothing to send yet)
+    const int64_t f1 = std::chrono::steady_clock::now().time_since_epoch().count();
     if (why == FR_WAIT) jt_mark(34, 0);   // (TICK-058: 34/35 a wait taking dev.present_mu)
     std::lock_guard lk(dev.present_mu);
+    const int64_t f2 = std::chrono::steady_clock::now().time_since_epoch().count();
     if (why == FR_WAIT) jt_mark(35, 0);
+    struct Acc { int64_t a, b, c; ~Acc() { rb_fl_ns[0] += b - a; rb_fl_ns[1] += c - b; rb_fl_ns[2] += std::chrono::steady_clock::now().time_since_epoch().count() - c; } } acc{f0, f1, f2};
     if (pend.cbs.empty()) return;
     flush_reason = why;
     queue_flush_locked();
@@ -3839,7 +3843,7 @@ struct RbScope {
             if (a < base || a >= base + 0x30000000) continue;
             if (seen++ >= 2) w += snprintf(site + w, sizeof site - w, "%s%x", w ? "," : "", (unsigned)(a - base));
         }
-        rb_wr_ns[0] = rb_wr_ns[1] = 0, rb_wr_miss = 0;
+        rb_wr_ns[0] = rb_wr_ns[1] = 0, rb_wr_miss = 0, rb_fl_ns[0] = rb_fl_ns[1] = rb_fl_ns[2] = 0;
         t0 = pt = now_ns();
     }
     static int64_t now_ns() { return std::chrono::steady_clock::now().time_since_epoch().count(); }
@@ -3848,9 +3852,9 @@ struct RbScope {
     ~RbScope();
 };
 struct RbAgg {
-    int64_t calls = 0, ever = 0, pending = 0, newest = 0, late = 0, ns_total = 0, ph[6] = {0, 0, 0, 0, 0, 0}, ns_max = 0, wr[2] = {0, 0}, miss = 0;
+    int64_t calls = 0, ever = 0, pending = 0, newest = 0, late = 0, ns_total = 0, ph[6] = {0, 0, 0, 0, 0, 0}, ns_max = 0, wr[2] = {0, 0}, miss = 0, fl[3] = {0, 0, 0};
     void add(const RbScope& s, int64_t total) {
-        wr[0] += rb_wr_ns[0], wr[1] += rb_wr_ns[1], miss += rb_wr_miss;
+        wr[0] += rb_wr_ns[0], wr[1] += rb_wr_ns[1], miss += rb_wr_miss, fl[0] += rb_fl_ns[0], fl[1] += rb_fl_ns[1], fl[2] += rb_fl_ns[2];
         calls++, ever += s.ever, pending += s.pending, newest += s.newest, late += s.late, ns_total += total;
         for (int i = 0; i < 6; i++) ph[i] += s.ph[i];
         ns_max = std::max(ns_max, total);
@@ -3886,10 +3890,10 @@ RbScope::~RbScope() {
     if (logged++ < 200) {
         auto line = [&](const char* what, const RbAgg& a) {
             logf("vk: rbprof %lld presents %s: %.1f calls/frame (%.1f with write-backs, %.1f pending, %.1f newest, %.1f late), %.2f ms/frame "
-                 "[ticket %.2f, catchup %.2f, recorded %.2f (flush %.2f, timeline %.2f, unknown %.1f/frame), gpu %.2f, strict %.2f, textures %.2f], max %.2f ms",
+                 "[ticket %.2f, catchup %.2f, recorded %.2f (flush %.2f = late fix %.2f + lock %.2f + sending %.2f, timeline %.2f, unknown %.1f/frame), gpu %.2f, strict %.2f, textures %.2f], max %.2f ms",
                  (long long)frames, what, a.calls / (double)frames, a.ever / (double)frames, a.pending / (double)frames,
                  a.newest / (double)frames, a.late / (double)frames, a.ns_total / 1e6 / frames, a.ph[0] / 1e6 / frames, a.ph[1] / 1e6 / frames,
-                 a.ph[2] / 1e6 / frames, a.wr[0] / 1e6 / frames, a.wr[1] / 1e6 / frames, a.miss / (double)frames, a.ph[3] / 1e6 / frames,
+                 a.ph[2] / 1e6 / frames, a.wr[0] / 1e6 / frames, a.fl[0] / 1e6 / frames, a.fl[1] / 1e6 / frames, a.fl[2] / 1e6 / frames, a.wr[1] / 1e6 / frames, a.miss / (double)frames, a.ph[3] / 1e6 / frames,
                  a.ph[4] / 1e6 / frames, a.ph[5] / 1e6 / frames, a.ns_max / 1e6);
         };
         line("all", rb_prof_all);
