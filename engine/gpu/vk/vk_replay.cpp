@@ -941,13 +941,15 @@ std::mutex ev_cpu_mu;
 std::vector<std::pair<uint64_t, uint32_t>> ev_cpu_pending;
 std::atomic<bool> ev_cpu_any{false};
 // (stream R2) RX_VK_WATCH_KICK=1: the CPU's event signal wakes the order thread (sync_watch) at once, instead of its Sleep(1)
-// finding the signal up to ~1-2 ms later (timer resolution 1 ms). Off: as before
+// finding the signal up to ~1-2 ms later (timer resolution 1 ms). On by default after the second session's validation (castle-move 10
+// runs against 10, 97.5 -> 104.5 fps, +7.1%; the three scenes ran clean, shots and frame-log luma right; docs/native-engine/readback.md).
+// RX_VK_WATCH_KICK=0: as before
 HANDLE watch_kick_event() {
     static HANDLE h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     return h;
 }
 bool watch_kick_on() {
-    static const bool v = getenv("RX_VK_WATCH_KICK") && atoi(getenv("RX_VK_WATCH_KICK")) != 0;
+    static const bool v = !getenv("RX_VK_WATCH_KICK") || atoi(getenv("RX_VK_WATCH_KICK")) != 0;
     return v;
 }
 std::unordered_set<uint64_t> cpu_events;   // (events the CPU has signalled, nvnEventSignal; ev_cpu_mu)

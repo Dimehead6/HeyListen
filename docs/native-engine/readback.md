@@ -130,37 +130,124 @@ Step 3 (the replay's own work, 4.6 ms on the 3050: page hashing, mirror sync, th
 replay do more, not less, on this PC (a staging copy per pool fill and write-back: -8.5%, 2 runs against 2); it saves memory (its
 purpose), not replay time, and none of the three costs went away. The per-phase cost with it on was not measured.
 
-## Switches built (all default off)
+## Switches built (default off, except the kick: see the second session)
 
 | switch | what it does | state |
 |---|---|---|
-| `RX_VK_WATCH_KICK=1` | the CPU's event signal sets an event the order thread waits on (1 ms timeout), so the stopped queue's replay starts at the signal | +6.8% castle-move, picture right; recommended on once the stalled runs are explained |
+| `RX_VK_WATCH_KICK` (**on by default since the second session**; `=0` off) | the CPU's event signal sets an event the order thread waits on (1 ms timeout), so the stopped queue's replay starts at the signal | +7.1% castle-move (10 against 10), +7.7% kokiri-idle (3 against 3), picture right; 23 runs from the title, no stall |
 | `RX_VK_READBACK_LATE=<rules>` | Longshot's #238 (`newest`, a hex size), plus `-<hex size>` to never; a ranged readback is read without its wait | no gain here; picture right for `2000,40`; the meter must not be named |
-| `RX_VK_RB_PROF=1`, `RX_VK_TL=<present>` / `RX_VK_TL_S=<s>`, `HOS_RB_LR_LOG=1` | the measurements above | logging only |
+| `RX_VK_RB_PROF=1`, `RX_VK_TL=<present>` / `RX_VK_TL_S=<s>` (now with the GPU's timestamps), `HOS_RB_LR_LOG=1` | the measurements above | logging only |
 
 ## Not verified
 
 - One scene (castle-move), one PC. Kokiri-idle and hyrule-walk were not run; the 3050 was not used (its numbers, 81% in waits, are C1's,
   not reproduced here: on this PC the readbacks wait 1.4-2.0 ms a frame on the chain, not 9 ms).
-- The two runs that stayed on the title screen (above).
-- `WATCH_KICK`'s picture was checked by one 25 s capture (2,545 frames) and no shots were compared by eye, only the luma figures.
+- The two runs that stayed on the title screen (above): not reproduced in the second session (see there); their cause is not known.
+- `WATCH_KICK`'s picture: second session, three scenes by eye and 12 frame-log captures (17,700 kick frames); two exposure pulses in the kick
+  arm, one in the baseline: not shown to differ, not shown equal. The PC 3050 was still not used.
 - The GPU completion's own time: the log's GPU time is 2.6-2.9 ms a frame and its "GPU tail" 0.4-0.7 ms, but a recording submitted at
   4.5 ms of the traced frame was not done on the timeline before 9.9 ms. Where the other ~3 ms go (the segments of the heavy command
   buffer are recorded together by the parallel replay and reach the queue together; the queue submit's own time was not logged until
   the last build) is the open question and the one worth the next stream's time: the heavy submission's GPU work is not pipelined with
   its replay.
 
-## Hand-over
+## Second session (2026-11-14 evening, main PC): the switch's safety, and what the GPU does between the pieces
 
-- Branch `stream/r2-readback`, worktree `E:\OOT\HeyListen-wt\r2-readback`. The tools: `RX_VK_RB_PROF` (`RbScope` in `vk_replay.cpp`),
-  `RX_VK_TL` (`tl_ev`, `tl_at_present`; its events include the recordings sent, the flushes, the late fixes and the queue submit's
-  start and end), `HOS_RB_LR_LOG` (`nvn_native.c`). Scratch scripts, not in the repository, under `E:\OOT\scratch-from-c\r2`:
-  `tlshow.py` (prints a `vk: tl` dump), `sym.py` (resolves the RB_PROF call sites against the link map), `lumastat.py` (mean luma per
-  frame of a frame log), `flrun.sh` (a run with the frame log for 25 s), `ab.sh` (interleaved arms).
-- Next, in order: (1) log the queue submit's duration and the gap between a recording's submit and the GPU's start (the events are in:
-  run `RX_VK_TL_S=78` and read `rec-qsubmit+/-` against the timeline's counter); (2) if the heavy submission's recordings reach the
-  queue late, submit the parallel replay's segments as they finish instead of together, or record the first segment short, so that the
-  GPU's 3 ms overlaps the replay's 4-8; the readbacks' wait then ends sooner and the frame with it; (3) register the meter's
-  write-back per recording instead of per submission, so a readback waits for the piece that wrote it; (4) explain the stalled runs
-  before `WATCH_KICK` is adopted.
-- Speed rows are in this document; the raw runs are in `build/s5/r2ab1-*`, `r2ab2-*`, `r2ab3-*` and `r2-fl-*` (local).
+### RX_VK_WATCH_KICK: the title-screen stalls, the three scenes, the speed
+
+- **Stall test.** 10 baseline and 10 `RX_VK_WATCH_KICK=1` runs of castle-move, interleaved, in the whole-machine lock, from the title
+  (scratch `stall.sh`): **20 of 20 left the title screen** (4,205-4,310 frames measured baseline, 4,507-4,604 kick). Baseline 96.2-98.1 fps,
+  mean 97.5; kick 103.9-105.2, mean 104.5: **+7.1%**, every kick run above every baseline run. With the 10 runs of this test, the three
+  validation runs, 7 frame-log runs and 3 kokiri-idle runs, 23 runs had the kick on and none stalled (the first session: 1 of ~6 with the kick stalled,
+  1 of ~3 with `NO_READBACK_WAIT`). The stalls were not reproduced with the kick or without it; the first suspect stays the scripted menu
+  input, known to be missed now and then. The kick's code has no path that can wait for something that never comes (the order thread waits
+  on the event with a 1 ms timeout, as it slept 1 ms before). Said plainly: 23 clean runs rule out a stall rate above ~12%, not a rare one.
+- **Validation, the three scenes** (`valid.sh`, kick on): kokiri-idle, castle-move, hyrule-walk all ran (4,358 / 4,541 / 4,374 frames), no
+  crash line, game-speed ratio 59.99 / 60.06 / 60.06; the last shots of each scene looked at by eye (the Kokiri lake at night, a field at night
+  with Link and Navi, a night road with ruins: not black, not white, not tinted, geometry and HUD whole).
+- **Picture by the frame log** (`RX_VK_FRAMELOG` 25 s, mean luma of every frame, scratch `lumastat.py` / `steps.py`): kokiri-idle base 50.67,
+  kick 50.42, no frame-to-frame step above 0.12; hyrule-walk base 47.0, 46.8, 48.0, 47.0 and kick 47.2, 46.0, 46.9, 47.3; castle-move base 41.3,
+  41.4 and kick 40.8, 41.7 (session 1: base 40.6, kick 41.0). One kind of event shows in both arms: the picture goes 8-15% brighter for
+  15-16 frames and comes back (the exposure pulse of the `RX_VK_READBACK_STRICT` note, a doubled meter sum): base 1 in 16,600 frames
+  (hyrule-walk), kick 2 in 17,700 frames (one hyrule-walk, one castle-move). The first session's baseline has them too (4 one-block events).
+  The kick does not make it obviously more frequent (2 against 1), and it is not new; it is also not proven not to.
+- **Speed**: castle-move above (10 against 10, +7.1%). Kokiri-idle, whole machine, 3 against 3 interleaved: base 93.8, 94.8, 94.5 (mean 94.4),
+  kick 101.5, 101.9, 101.6 (mean 101.7): **+7.7%**, no stall. **The kick is now on by default** (`RX_VK_WATCH_KICK=0` turns it off): the
+  three scenes ran clean and the picture is right by eye and by luma; it is its own commit, easy to take back if the owner's play shows
+  anything.
+
+### What the GPU does between the pieces of the heavy submission (`RX_VK_TL_S`, now with the GPU's own timestamps)
+
+`RX_VK_TL` / `RX_VK_TL_S` now also print the GPU's side: every recording's upload and command buffer start and end on the host clock
+(`gpu-up+/-`, `gpu-cmd+/-` lines; the timestamps are read when the recording's slot comes round, so they are printed 14 presents after the
+window opens; `VK_EXT_calibrated_timestamps`, enabled only with the timeline on). The queue's other submits (present's blit, sparse binds,
+texture and memory readback submits) have `blit-submit` / `bind-sparse` / `tex-rb-submit` / `mem-submit` events: in a frame's window only
+the present's blit is submitted besides the recordings (no bind, no readback submit). Scratch `gpulag.py` tables each recording's queue
+submit, GPU start and end. Castle-move, 3 frames, kick off, the heavy submission (4 pieces, cut where a queue stops at an event wait):
+
+| piece | queue submit (ms) | GPU start after the submit (ms) | GPU idle before it (ms) | GPU time (ms) |
+|---|---:|---:|---:|---:|
+| 1 | 0.57 | 0.02 | | 0.24 |
+| 2 | 1.77 | 0.02 | | 1.14 |
+| 3 | 2.98 | **0.94** | 1.0 | 0.55 |
+| 4 (the last: the write-backs, the timeline value) | 4.87 | **4.56** | 4.96 | 0.20 |
+
+The same in every frame and every run (piece 3 starts 0.78-1.08 ms late, piece 4 4.0-4.7 ms late). The pieces' queue submits take 15-40 us
+(`rec-qsubmit`) and the GPU is idle (the GPU time of the whole heavy submission is 2.1 ms) while the piece sits in the queue. So the **3 ms
+between the submit of the heavy recording and its completion is neither GPU work nor the submit's cost: the GPU starts the last piece 4.5 ms
+after it was submitted, and the readbacks of the next frame's CPU phase wait for that**: the late fix's wait ends with the end of piece 4 (the
+fix thread's `fix-wait-` 0.05 ms after `gpu-cmd-`). Once the GPU starts piece 4, everything queued behind it (the Presentation Thread's six
+small recordings, a dozen command buffers) runs back to back in 0.3 ms. The two late starts (piece 3's and 4's) are 4.5-5.8 ms apart, ~5.2
+on average, and fall at the same phase of every frame.
+
+What did not change it (each a timeline run of castle-move, the same delays): a `vkGetFenceStatus`, a `vkGetSemaphoreCounterValue` or an
+empty `vkQueueSubmit2` after each submit (to make the driver hand the work over: `RX_VK_SUBMIT_KICK`, built and taken out), `RX_VK_CHUNK=0`,
+`RX_VK_POOL_MIRROR=1`, `RX_VK_PRESENT_QUEUE=0`, `RX_VK_BATCH=1` (with and without `RX_VK_BATCH_IDLE=0`), and holding the third and later
+non-signalling pieces to send them with the signalling one in one submission (`RX_VK_TAIL_HOLD`, built and taken out: piece 3 then started
+at once when it went out alone 2.2 ms after piece 2's end; piece 4, submitted 0.2 ms after piece 3's end, still started 4.9 ms later; fps
+95.7 against 97). What fits all of it: **a submission that reaches the queue soon (under ~0.5 ms) after the previous one's completion waits
+~1 ms (after piece 2) or ~5 ms (after piece 3) before the GPU starts it, with nothing running; one that comes 0.9 ms or more after a
+completion starts at once.** The cause is not found (the queue's scheduling after a completion in the driver or the OS; not PCIe, which is
+Gen5 x16, and not a pool or a write-back cost: pool mirrors, chunking, batching and the presents' own queue change nothing). It is the one
+lever left under the frame's loop: with piece 4 started when it is submitted, the GPU would be done at ~5.4 ms of the frame instead of 9.6,
+before the readbacks come (7.8 ms), and the late fix's wait (1.9 ms in that frame) would be gone. Not built: nothing tried moves it.
+
+One more try, `RX_VK_PIECE_GAP_US=1000` (built and taken out): a piece of a submission is sent only 1 ms after the GPU's end of the
+previous piece (its bottom-of-pipe timestamp against the calibrated device clock now). Piece 3 then started 0.02-0.09 ms after its submit
+(the rule holds for it), but piece 4, submitted 1.2-1.3 ms after piece 3's end, still started 4.28-4.4 ms later, and the frame rate fell
+(91.5 against 97). So the piece-4 delay is not about its arrival after the previous completion either; nothing at that moment on the
+CPU side of the timeline (all the threads are in waits or quiet) explains it.
+
+### The late-fix dependency (item 3): real
+
+The readbacks of frame N+1 do not wait for the late page in order to read their own range; they wait for the GPU's completion of the
+write-back of the previous heavy submission, and their range depends on that. (1) The writer value of the meter's ranges (`rb-val`) is the
+heavy submission's own, `value_rec` maps it to the FIRST recording of that submission (an earlier one, long done), so the recordings'
+semaphore alone lets the read pass: five readbacks of the same writer made 4.9 ms into the frame, before any late fix existed, passed in 4
+us each and read what the GPU had not written yet (ranges of other uses, so the picture is not what they decide). (2) The late fix that
+holds the later ones has the same value as that writer: the capture of the next frame's first held submit finds the heavy submission's last
+write-back still pending (`fix-pending`, the value the readbacks wait on). So there is no readback that waits for the late page and does not
+depend on it here; skipping the flush's wait (`RX_VK_WAIT_REC_SENT`, session 1) burned the picture out for that reason. What would shorten the
+wait is the GPU completing sooner (above), or the meter being written back by an earlier piece than the last (registered per submission, at
+its end today; not changed).
+
+## Hand-over (second session)
+
+- Branch `stream/r2-readback`, worktree `E:\OOT\HeyListen-wt\r2-readback`. New tooling, all logging: the GPU side of `RX_VK_TL` /
+  `RX_VK_TL_S` (`tl_gpu_dump`, `TlGpuRec` in `vk_replay.cpp`; `VK_EXT_calibrated_timestamps` is enabled only when the timeline is asked for),
+  `vk_tl_note` (events from `vk_texture.cpp` / `vk_memory.cpp`). Scratch scripts, not in the repository, under
+  `E:\OOT\scratch-from-c\r2b`: `tlrun.sh` (one castle-move run with the timeline at 70 s, merged and tabled), `tlmerge.py`, `gpulag.py`
+  (each recording's submit, GPU start and end), `stall.sh` (interleaved arms with frames and fps), `flmany.sh` + `steps.py` (frame-log runs,
+  luma steps), the older `lumastat.py` / `tlshow.py` under `r2`.
+- Session 1's tools (RX_VK_RB_PROF, HOS_RB_LR_LOG, RX_VK_TL) are described under "Tools built".
+- Built and taken out (the numbers are in "What the GPU does between the pieces"): `RX_VK_SUBMIT_KICK`, `RX_VK_TAIL_HOLD`,
+  `RX_VK_PIECE_GAP_US`.
+- Next, in order: (1) **find what delays the GPU's start of the heavy submission's last piece by 4.3-4.7 ms** (and the third by ~1 ms):
+  piece 4 is submitted at ~5 ms of the frame and starts at ~9.5, with the GPU idle, whatever the submit path (batched, kicked, alone, with a
+  gap, on the presents' own queue or not). Ideas not tried: the same timeline with the game's window in fullscreen (`fullscreen=1`: DWM is out
+  of the queue's scheduling), with `HOS_` / driver settings that change the GPU's scheduling (hardware-accelerated GPU scheduling), a timeline
+  on the PC 3050 (it is the machine where the readbacks cost 9 ms) to see if the late start is the same there, a Vulkan `VK_NV_low_latency2`
+  off/on A/B, and a trace of the process with ETW GPU events (GPUView) for one frame: it shows what the queue's hardware context waits on.
+  If the late start goes away, the late fix's wait (1.4-1.9 ms a frame) goes with it, and `NO_READBACK_WAIT`'s +17% is the bound of the gain.
+  (2) The exposure pulse (15-16 frames, +8-15%) exists with and without the kick at about 1 in 10,000 frames; `RX_VK_READBACK_STRICT=1`
+  is its known cure (18% on this driver): a cheaper exact rule is wanted. (3) The PC 3050 was not used by either session.
