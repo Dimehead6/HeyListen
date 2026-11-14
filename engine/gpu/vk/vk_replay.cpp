@@ -801,7 +801,8 @@ void probe_job_submit() {   // (dev.present_mu held by the monitor)
     si.pCommandBufferInfos = &cbi;
     probe.job_host[i] = tl_now();
     tl_ev("job-sub", i);
-    vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
+    const VkQueue replay_queue = dev.queue;   // (a probe, not a replay submit: nothing held for a late fix is involved)
+    vkQueueSubmit2(replay_queue, 1, &si, VK_NULL_HANDLE);
 }
 void probe_monitor_start() {
     static std::once_flag once;
