@@ -3836,6 +3836,7 @@ RbScope::~RbScope() {
     if (!on) return;
     const int64_t total = now_ns() - t0;
     if (tl_active.load(std::memory_order_relaxed)) {
+        if (pending) tl_ev("rb-val", value, fence_at, completed());
         tl_ev("rb-end", gpu, size, (uint64_t)(total / 1000) | (uint64_t)(ph[2] / 1000) << 24 | (uint64_t)(ph[3] / 1000) << 40 | (uint64_t)late << 63);
     }
     static const bool aggregate = getenv("RX_VK_RB_PROF") != nullptr;
