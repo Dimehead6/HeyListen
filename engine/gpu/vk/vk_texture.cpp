@@ -3726,7 +3726,7 @@ int texture_flush_to_guest(uint64_t lo, uint64_t size) {
     return done;
 }
 
-void texture_written(Texture* tex) {
+void texture_written(Texture* tex, const char* why) {
     if (!tex) return;
     ledger_mark(tex->gpu, tex->guest_size, kUseRendered);   // (RX_VK_LEDGER)
     if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) {   // (a parallel replay's order broken: see dry_mark_written)
@@ -3744,6 +3744,18 @@ void texture_written(Texture* tex) {
     }
     watch_tex(tex, "written");
     if (!tex->gpu_written || tex->released) tex->first_written = frame_no;
+    // (ported from Longshot 9fccd0fd, Hookshot #3004) A texture in a virtual pool that the GPU writes first is marked uploaded
+    // below without the first upload, which notes its pages' mapping (texture_touch): its first check after the game finalized
+    // it took all of its storage for remapped, and the whole image was uploaded from guest memory over the GPU's texels (OoT's
+    // HUD button labels blank after a zone change; issue 3's black surfaces in Zora's Domain). Noted here instead, by the
+    // writers that give a reason: each holds the ParLock a change to the map needs, or is the dry pass
+    // (tests/test_drawn_page_map.py lists them). The upscaler's stand-ins give none and run without that lock. A texture clear
+    // gives none: resolve() samples its texture first, which notes the map. RX_VK_NO_DRAWN_PAGE_MAP=1: as before
+    static const bool note_map = !env_on("RX_VK_NO_DRAWN_PAGE_MAP");
+    if (why && strcmp(why, "?") != 0 && note_map && tex->gpu >= (1ull << 40) && tex->page_map.empty() && tex->guest_size) {
+        static thread_local Ranges mapped;
+        texture_dirty(*tex, 0, mapped);
+    }
     tex->last_written = frame_no;
     tex->gpu_written = true;
     tex->gpu_gen = memory_generation();
