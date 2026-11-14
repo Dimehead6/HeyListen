@@ -3144,8 +3144,13 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     if (sparse_written) texture_dirty(*tex, 0, dirty);
     if (tex->gpu_written) {   // (an image the GPU drew, finalized and sampled again: from guest memory, 400 lines)
         static int logged;
+        static std::atomic<int64_t> total{0}, total_finalized{0};   // (the log stops at 400 lines: these count them all)
         uint64_t kb = 0;
         for (const auto& r : dirty) kb += (r.second - r.first) >> 10;
+        const int64_t n_all = ++total, n_fin = tex->released ? ++total_finalized : total_finalized.load();
+        if (logged >= 400 && n_all % 500 == 0)
+            logf("vk: uploads over a drawn image: %lld so far, %lld of them finalized, at present %llu", (long long)n_all,
+                 (long long)n_fin, (unsigned long long)(frame_no - 1));
         if (logged++ < 400)
             logf("vk: upload over a drawn image: #%u %#llx %ux%ux%u x%u NVN %#x at present %llu (texture frame %llu), %s, "
                  "%llu KB dirty in %zu ranges%s", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->depth,
