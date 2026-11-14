@@ -828,9 +828,12 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         }
         return;
     }
+    tl_ev("rec-locked", seq, r.value);
     queue_flush_locked();   // (TICK-060: recordings held for a fix go first, the fix applied (waited for here without a batch semaphore))
     PROF(PROF_QSUBMIT);
+    tl_ev("rec-qsubmit+", seq);
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
+    tl_ev("rec-qsubmit-", seq);
     r.submitted = res == VK_SUCCESS;
     if (r.submitted && signal_value) note_signal_sent(signal.value);
     if (r.submitted && seq) rec_sent_note(seq);
