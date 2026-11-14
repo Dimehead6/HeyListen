@@ -233,6 +233,13 @@ std::mutex replay_mu;   // one replay at a time (the game submits from several t
 VkSemaphore batch_tl = VK_NULL_HANDLE;
 uint64_t batch_next = 0, batch_flushed = 0;
 struct { std::vector<VkCommandBufferSubmitInfo> cbs; uint64_t signal = 0; bool any_signal = false; uint64_t rec = 0; } pend;   // (rec: the recordings' timeline value the held ones reach)
+// (stream R2, RX_VK_WAIT_REC_SENT) the highest recording number handed to the queue (a direct submit, or a batch's flush, under
+// dev.present_mu): every recording up to it is on the queue, so waiting for one of them needs no flush of the held ones
+std::atomic<uint64_t> rec_sent{0};
+void rec_sent_note(uint64_t seq) {
+    uint64_t cur = rec_sent.load(std::memory_order_relaxed);
+    while (seq > cur && !rec_sent.compare_exchange_weak(cur, seq, std::memory_order_release, std::memory_order_relaxed)) {}
+}
 int64_t st_flushes, st_batched_cbs;
 enum { FR_OTHER, FR_POLL, FR_WAIT, FR_SLOT, FR_PRESENT, FR_CAP, FR_VALUE, FR_COUNT };
 int64_t st_reason[FR_COUNT];
@@ -413,6 +420,7 @@ void queue_flush_locked() {   // (dev.present_mu held)
     tl_ev("flush-submit", pend.cbs.size(), pend.signal, pend.rec);
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
     if (res == VK_SUCCESS && pend.any_signal) note_signal_sent(pend.signal);
+    if (res == VK_SUCCESS && pend.rec) rec_sent_note(pend.rec);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: batched submit %llu failed (%d)", (unsigned long long)batch_next, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
@@ -825,6 +833,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
     r.submitted = res == VK_SUCCESS;
     if (r.submitted && signal_value) note_signal_sent(signal.value);
+    if (r.submitted && seq) rec_sent_note(seq);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
@@ -3588,7 +3597,18 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
         if (tl_active.load(std::memory_order_relaxed)) vkGetSemaphoreCounterValue(dev.device, rec_timeline, &rc);
         tl_ev("wait-rec+", f, seq, rc);
     }
-    queue_flush_for(FR_WAIT);
+    // (stream R2, RX_VK_WAIT_REC_SENT=1) A recording already on the queue is waited for on its semaphore, no flush first. The flush
+    // exists for the recordings still held in a batch, and its first step waits for the pending late fix, the GPU's completion of
+    // the write-back a capture is waiting for: 5-6 ms a frame summed over the threads that read GPU results (castle-move, main PC),
+    // where the semaphore itself had been signalled already or needed 0.1 ms. The readback waits for the same recording as before
+    static const bool sent_on = getenv("RX_VK_WAIT_REC_SENT") && atoi(getenv("RX_VK_WAIT_REC_SENT")) != 0;
+    static std::atomic<int64_t> st_skip{0}, st_flush{0};
+    if (sent_on && seq <= rec_sent.load(std::memory_order_acquire)) {
+        if (++st_skip % 3000 == 1) logf("vk: waits for a recording already sent skip the flush (RX_VK_WAIT_REC_SENT): %lld skipped, %lld flushed", (long long)st_skip.load(), (long long)st_flush.load());
+    } else {
+        st_flush++;
+        queue_flush_for(FR_WAIT);
+    }
     const int64_t wr1 = std::chrono::steady_clock::now().time_since_epoch().count();
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
