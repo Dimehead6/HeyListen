@@ -776,7 +776,11 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         late_hold = memory_late_fix_pending() && batch_tl != VK_NULL_HANDLE;
         if (late_hold) st_lf_held_cbs += n;
     }
-    tl_ev("rec-submit", seq, r.value, (uint64_t)(batch_on() || late_hold) | (uint64_t)late_hold << 1);
+    {
+        uint64_t rc = 0, tc = 0;
+        if (tl_active.load(std::memory_order_relaxed)) vkGetSemaphoreCounterValue(dev.device, rec_timeline, &rc), vkGetSemaphoreCounterValue(dev.device, timeline, &tc);
+        tl_ev("rec-submit", seq, r.value, (uint64_t)(batch_on() || late_hold) | (uint64_t)late_hold << 1 | rc << 8 | tc << 40);
+    }
     if (batch_on() || late_hold) {
         if (pend.cbs.empty()) batch_next++, pend_since = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < n; i++) pend.cbs.push_back(cb[i]);
@@ -3568,7 +3572,11 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
     }
     // (a batched submit holds its recordings' signal until the batch goes out: the readback wait in invalidate came here
     // without a flush, and the job that waited held up the main thread, so nothing flushed it: the load hang on RADV)
-    tl_ev("wait-rec+", f, seq, 0);
+    {
+        uint64_t rc = 0;
+        if (tl_active.load(std::memory_order_relaxed)) vkGetSemaphoreCounterValue(dev.device, rec_timeline, &rc);
+        tl_ev("wait-rec+", f, seq, rc);
+    }
     queue_flush_for(FR_WAIT);
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
