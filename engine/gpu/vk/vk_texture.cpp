@@ -3481,7 +3481,9 @@ bool readback_submit_wait() {
         late_fix_wait_unlocked();   // (TICK-060: a pending late fix waited for outside the queue's lock)
         std::lock_guard qk(dev.present_mu);   // (one queue: submits and presents take turns)
         queue_flush_locked();
+        vk_tl_note("tex-rb-submit+");
         if (vkQueueSubmit2(dev.queue, 1, &si, rb_fence) != VK_SUCCESS) return false;
+        vk_tl_note("tex-rb-submit-");
     }
     return vkWaitForFences(dev.device, 1, &rb_fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
 }
@@ -3914,7 +3916,9 @@ bool sparse_flush(Texture* tex) {
         std::lock_guard qk(dev.present_mu);
         queue_flush_locked();
         if (!no_idle) vkQueueWaitIdle(dev.queue);
+        vk_tl_note("bind-sparse+", no_idle ? 0 : 1);
         res = vkQueueBindSparse(dev.queue, 1, &bi, fence);
+        vk_tl_note("bind-sparse-");
         if (++binds % 200 == 0) logf("vk: %lld sparse binds", (long long)binds);
     }
     if (res == VK_SUCCESS) {

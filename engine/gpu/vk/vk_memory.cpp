@@ -275,7 +275,9 @@ bool import_dma_buf_pieces(uint64_t lo, uint64_t hi, uint64_t piece, Pool& p) {
             late_fix_wait_unlocked();   // (TICK-060m: a pending late fix waited for outside the queue's lock, as the other senders)
             std::lock_guard qk(dev.present_mu);
             queue_flush_locked();
+            vk_tl_note("bind-sparse-pool+");
             res = vkQueueBindSparse(dev.queue, 1, &si, fence);
+            vk_tl_note("bind-sparse-pool-");
         }
         if (res == VK_SUCCESS) {
             res = vkWaitForFences(dev.device, 1, &fence, VK_TRUE, UINT64_MAX);
@@ -7459,7 +7461,9 @@ int memory_mirror_read(uint64_t guest, uint64_t size, void* out) {
             late_fix_wait_unlocked();
             std::lock_guard qk(dev.present_mu);   // (one queue: submits and presents take turns)
             queue_flush_locked();
+            vk_tl_note("mem-submit+");
             done = vkQueueSubmit2(dev.queue, 1, &si, fence) == VK_SUCCESS;
+            vk_tl_note("mem-submit-");
         }
         done = done && vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
     }

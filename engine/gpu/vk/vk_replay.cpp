@@ -130,13 +130,18 @@ void tl_ev(const char* what, uint64_t a, uint64_t b, uint64_t c) {
 }
 /// at the top of a present: opens the window at present `from`, writes it out 3 presents later
 inline void tl_ev(const char* what, uint64_t a = 0, uint64_t b = 0) { tl_ev(what, a, b, 0); }
+void tl_gpu_open();                  // (stream R2: the GPU side of the window, below with the recordings' timestamps)
+void tl_gpu_close();
+void tl_gpu_dump(int64_t t0_ns);
 void tl_at_present(int64_t presents) {
     static const bool want = tl_wanted();
     if (!want) return;
     if (tl_start_ns && tl_now() >= tl_start_ns) tl_from = presents, tl_start_ns = 0;
-    if (presents == tl_from && !tl_active.load()) tl_t0 = tl_now(), tl_n = 0, tl_active = 1;
+    if (presents == tl_from && !tl_active.load()) tl_t0 = tl_now(), tl_n = 0, tl_active = 1, tl_gpu_open();
+    if (presents == tl_from + 14 && tl_from >= 0) tl_gpu_dump(tl_t0);   // (the recordings' times are read once their slots come round)
     if (presents == tl_from + 3 && tl_active.load()) {
         tl_active = 0;
+        tl_gpu_close();
         const uint32_t n = std::min<uint32_t>(tl_n.load(), kTlMax);
         std::vector<uint32_t> ord(n);
         for (uint32_t i = 0; i < n; i++) ord[i] = i;
@@ -364,6 +369,7 @@ void late_fix_flush_locked() {
     memory_late_fix_apply(std::max(completed(), v));   // (v: past the timeouts, as the take's wait went on after 250 ms)
 }
 } // namespace
+void vk_tl_note(const char* what, uint64_t a, uint64_t b) { tl_ev(what, a, b); }
 uint64_t vk_timeline_signal_sent() { return tl_signal_sent.load(std::memory_order_acquire); }
 void vk_timeline_wait_sent(uint64_t v) {
     if (!timeline || completed() >= v) return;
@@ -589,6 +595,12 @@ uint64_t ts_last_end;   // (the last collected command buffer's end, GPU ticks)
 struct TsRec { uint64_t seq, start, end, value = 0; };
 std::mutex ts_mu;
 std::deque<TsRec> ts_recs;
+// (stream R2, RX_VK_TL) each collected recording's timestamps in GPU ticks (the upload's start and end, the command buffer's), with its
+// number on the recordings' timeline: tl_gpu_dump puts them on the host clock beside the timeline's events
+struct TlGpuRec { uint64_t recseq, value, us, ue, cs, ce; };
+std::deque<TlGpuRec> tl_gpu_recs;   // (ts_mu)
+uint64_t ts_recseq[kRecordings];    // (the recordings' timeline value each slot's last submit signals)
+uint64_t tl_rec_lo = 0, tl_rec_hi = 0;
 // (TICK-057) the GPU's busy tail before each late-page wait ended: the timeline value the capture waited for (gpu_tail_note_late),
 // and once its recordings are collected, the GPU time it ran without a gap up to that value's end. GPU work cut inside that tail
 // shortens the wait (the frame on PC 3050 is serial: the CPU waits there); work cut before a gap does not. Logged every 120
@@ -641,6 +653,10 @@ void gpu_time_collect(Recording& r) {
     }
     if (end > ts_last_end) ts_last_end = end;
     std::lock_guard lk(ts_mu);
+    if (dev.calibrated_ts) {   // (RX_VK_TL: the recording's own times, for the timeline's GPU side)
+        tl_gpu_recs.push_back({ts_recseq[r.slot], ts_sig[r.slot], up && t[1] > t[0] ? t[0] : 0, up && t[1] > t[0] ? t[1] : 0, t[2], t[3]});
+        while (tl_gpu_recs.size() > 512) tl_gpu_recs.pop_front();
+    }
     ts_recs.push_back({++ts_seq_collected, start, end, ts_sig[r.slot]});
     while (ts_recs.size() > 256) ts_recs.pop_front();
     while (!late_values.empty() && late_values.front() < ts_sig[r.slot]) {   // (its recordings collected: the tail before it)
@@ -687,6 +703,47 @@ void gpu_time_begin(Recording& r) {
     vkCmdWriteTimestamp2(r.upload, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts_pool, 4 * r.slot);
     vkCmdResetQueryPool(r.cmd, ts_pool, 4 * r.slot + 2, 2);
     vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts_pool, 4 * r.slot + 2);
+}
+void tl_gpu_open() { tl_rec_lo = rec_seq; }
+void tl_gpu_close() { tl_rec_hi = rec_seq; }
+/// (stream R2, RX_VK_TL) the GPU's own side of the window, ~11 presents after it closed (a recording's times are read when its slot comes
+/// round): per recording of the window, its upload's and its command buffer's start and end on the host's clock (the same as the timeline's
+/// events), as "gpu-up" / "gpu-cmd" lines of the form tlshow.py reads (what, recording number, value, duration in us)
+void tl_gpu_dump(int64_t t0_ns) {
+    static PFN_vkGetCalibratedTimestampsEXT get = (PFN_vkGetCalibratedTimestampsEXT)vkGetDeviceProcAddr(dev.device, "vkGetCalibratedTimestampsEXT");
+    if (!dev.calibrated_ts || !get) return;
+    VkCalibratedTimestampInfoEXT info[2]{{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr, VK_TIME_DOMAIN_DEVICE_EXT},
+                                         {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr, VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT}};
+    uint64_t stamp[2] = {0, 0}, dev_dev = 0;
+    LARGE_INTEGER freq, qpc;
+    QueryPerformanceFrequency(&freq);
+    const int64_t steady0 = tl_now();
+    if (get(dev.device, 2, info, stamp, &dev_dev) != VK_SUCCESS) return;
+    QueryPerformanceCounter(&qpc);
+    const int64_t steady1 = tl_now();
+    // (the host stamp was taken inside the call: its steady-clock time is between the two reads, taken as their middle)
+    const double qpc_ns_now = (double)qpc.QuadPart * 1e9 / (double)freq.QuadPart, stamp_ns = (double)stamp[1] * 1e9 / (double)freq.QuadPart;
+    const double host_at_stamp = (double)(steady0 + steady1) * 0.5 - (qpc_ns_now - stamp_ns);
+    const double period = (double)dev.props.limits.timestampPeriod;
+    auto host_ms = [&](uint64_t ticks) { return (host_at_stamp + ((double)ticks - (double)stamp[0]) * period - (double)t0_ns) / 1e6; };
+    std::vector<TlGpuRec> v;
+    {
+        std::lock_guard lk(ts_mu);
+        for (const TlGpuRec& g : tl_gpu_recs)
+            if (g.recseq + 8 >= tl_rec_lo && g.recseq <= tl_rec_hi) v.push_back(g);
+    }
+    logf("vk: tl gpu begin (%zu recordings %llu..%llu)", v.size(), (unsigned long long)tl_rec_lo, (unsigned long long)tl_rec_hi);
+    for (const TlGpuRec& g : v) {
+        if (g.ue > g.us && g.us) {
+            logf("vk: tl %9.3f GPU                    gpu-up+        %#llx %#llx %#llx", host_ms(g.us), (unsigned long long)g.recseq, (unsigned long long)g.value, 0ull);
+            logf("vk: tl %9.3f GPU                    gpu-up-        %#llx %#llx %#llx", host_ms(g.ue), (unsigned long long)g.recseq, (unsigned long long)g.value,
+                 (unsigned long long)((g.ue - g.us) * period / 1000));
+        }
+        logf("vk: tl %9.3f GPU                    gpu-cmd+       %#llx %#llx %#llx", host_ms(g.cs), (unsigned long long)g.recseq, (unsigned long long)g.value, 0ull);
+        logf("vk: tl %9.3f GPU                    gpu-cmd-       %#llx %#llx %#llx", host_ms(g.ce), (unsigned long long)g.recseq, (unsigned long long)g.value,
+             (unsigned long long)((g.ce - g.cs) * period / 1000));
+    }
+    logf("vk: tl gpu end");
 }
 void gpu_time_end(Recording& r, bool uploads) {
     if (!ts_pool) return;
@@ -758,6 +815,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     uint64_t seq = 0;
     if (rec_timeline) {   // (and its number on the recordings' timeline; every caller holds replay_mu: in order)
         seq = ++rec_seq;
+        ts_recseq[r.slot] = seq;   // (RX_VK_TL's GPU side)
         lag_recording_submitted(seq);   // (RX_VK_LAG_LOG)
         signals[nsig].semaphore = rec_timeline;
         signals[nsig].value = seq;
@@ -790,7 +848,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     {
         uint64_t rc = 0, tc = 0;
         if (tl_active.load(std::memory_order_relaxed)) vkGetSemaphoreCounterValue(dev.device, rec_timeline, &rc), vkGetSemaphoreCounterValue(dev.device, timeline, &tc);
-        tl_ev("rec-submit", seq, r.value, (uint64_t)(batch_on() || late_hold) | (uint64_t)late_hold << 1 | rc << 8 | tc << 40);
+        tl_ev("rec-submit", seq, r.value, (uint64_t)(batch_on() || late_hold) | (uint64_t)late_hold << 1 | (uint64_t)signal_value << 2 | rc << 8 | tc << 40);
     }
     if (batch_on() || late_hold) {
         if (pend.cbs.empty()) batch_next++, pend_since = std::chrono::steady_clock::now();
@@ -5535,7 +5593,9 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         std::memcpy(r0, st_reason, sizeof r0);
     }
     reflex_submit_ends();
+    tl_ev("blit-submit+");
     vkQueueSubmit2(dev.queue, 1, &si, f.done);
+    tl_ev("blit-submit-");
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.pNext = reflex_present_id(nullptr);   // (NVIDIA Reflex: the frame's present id, and its present's markers)
     pi.waitSemaphoreCount = 1;
