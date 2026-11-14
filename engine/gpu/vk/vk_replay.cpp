@@ -3701,7 +3701,20 @@ struct RbScope {
     int64_t t0 = 0, ph[6] = {0, 0, 0, 0, 0, 0}, pt = 0;
     bool ever = false, pending = false, newest = false;
     uint64_t value = 0, fence_at = 0;
-    explicit RbScope(bool o, uint64_t g, uint64_t s) : on(o), gpu(g), size(s) { if (on) t0 = pt = now_ns(); }
+    char site[80] = "";   // (the exe's frames above the renderer: the guest function that asked, by its address in the exe's map)
+    explicit RbScope(bool o, uint64_t g, uint64_t s) : on(o), gpu(g), size(s) {
+        if (!on) return;
+        void* bt[14];
+        const USHORT n = CaptureStackBackTrace(1, 14, bt, nullptr);
+        const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+        int w = 0, seen = 0;
+        for (USHORT i = 0; i < n && seen < 5; i++) {
+            const uintptr_t a = (uintptr_t)bt[i];
+            if (a < base || a >= base + 0x30000000) continue;
+            if (seen++ >= 2) w += snprintf(site + w, sizeof site - w, "%s%x", w ? "," : "", (unsigned)(a - base));
+        }
+        t0 = pt = now_ns();
+    }
     static int64_t now_ns() { return std::chrono::steady_clock::now().time_since_epoch().count(); }
     void mark(int p) { if (!on) return; const int64_t t = now_ns(); ph[p] += t - pt; pt = t; }
     void skip() { if (on) pt = now_ns(); }   // (time not charged to a phase)
@@ -3735,7 +3748,7 @@ struct RbAgg {
 };
 std::mutex rb_prof_mu;
 std::map<std::pair<uint64_t, uint64_t>, RbAgg> rb_prof_ranges;
-std::map<std::string, RbAgg> rb_prof_threads;
+std::map<std::string, RbAgg> rb_prof_threads, rb_prof_sites;
 RbAgg rb_prof_all;
 int64_t rb_prof_next = 300, rb_prof_from = 0;
 RbScope::~RbScope() {
@@ -3745,6 +3758,11 @@ RbScope::~RbScope() {
     if (!rb_prof_from) rb_prof_from = presents_now, rb_prof_next = presents_now + 300;   // (the first window starts here)
     rb_prof_all.add(*this, total);
     rb_prof_threads[rb_thread_label()].add(*this, total);
+    if (rb_prof_sites.size() < 256 || rb_prof_sites.count(site)) {
+        char k[120];
+        snprintf(k, sizeof k, "%s %#llx+%#llx", site, (unsigned long long)gpu, (unsigned long long)size);
+        rb_prof_sites[k].add(*this, total);
+    }
     if (rb_prof_ranges.size() < 512 || rb_prof_ranges.count({gpu, size})) rb_prof_ranges[{gpu, size}].add(*this, total);
     if (presents_now < rb_prof_next) return;
     const int64_t frames = std::max<int64_t>(1, presents_now - rb_prof_from);
@@ -3759,6 +3777,11 @@ RbScope::~RbScope() {
         };
         line("all", rb_prof_all);
         for (const auto& t : rb_prof_threads) line(t.first.c_str(), t.second);
+        {
+            std::vector<std::pair<std::string, RbAgg>> sv(rb_prof_sites.begin(), rb_prof_sites.end());
+            std::sort(sv.begin(), sv.end(), [](const auto& a, const auto& b) { return a.second.ns_total > b.second.ns_total; });
+            for (size_t i = 0; i < sv.size() && i < 10; i++) line(("site " + sv[i].first).c_str(), sv[i].second);
+        }
         std::vector<std::pair<std::pair<uint64_t, uint64_t>, RbAgg>> v(rb_prof_ranges.begin(), rb_prof_ranges.end());
         std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.ns_total > b.second.ns_total; });
         for (size_t i = 0; i < v.size() && i < 12; i++) {
@@ -3769,6 +3792,7 @@ RbScope::~RbScope() {
     }
     rb_prof_all = RbAgg();
     rb_prof_threads.clear();
+    rb_prof_sites.clear();
     rb_prof_ranges.clear();
     rb_prof_from = presents_now;
     rb_prof_next = presents_now + 300;
