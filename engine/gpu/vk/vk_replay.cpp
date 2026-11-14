@@ -443,7 +443,9 @@ void late_fix_main() {
         wi.semaphoreCount = 1;
         wi.pSemaphores = &timeline;
         wi.pValues = &v;
+        tl_ev("fix-wait+", v);
         vkWaitSemaphores(dev.device, &wi, 250000000ull);   // (a flush elsewhere may have applied it meanwhile)
+        tl_ev("fix-wait-", v);
         jt_mark(38, v);
         // (TICK-060m) the copies as soon as the value is reached, before the queue's lock (another thread's submit may hold it):
         // the take's wait made them at once, and the game's CPU may write such a page again soon after the write-back (OoT's
@@ -473,6 +475,7 @@ void late_fix_main() {
 }
 } // namespace
 void late_fix_wake(uint64_t v) {
+    tl_ev("fix-pending", v);
     static std::once_flag started;
     std::call_once(started, [] { std::thread(late_fix_main).detach(); });
     {
