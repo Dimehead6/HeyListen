@@ -74,6 +74,80 @@ void jt_mark(int kind, uint64_t v) {
 }
 extern std::atomic<bool> movie_networks_slow;   // (vk_draw.cpp: the movie networks left out, issue 109)
 int64_t presents_now;   // (the presents so far, for SlowWatch)
+namespace {
+const char* rb_thread_label() {
+    thread_local char name[40];
+    thread_local bool have = false;
+    if (!have) {
+        have = true;
+        snprintf(name, sizeof name, "tid%lu", (unsigned long)GetCurrentThreadId());
+        typedef HRESULT(WINAPI * GetDesc)(HANDLE, PWSTR*);
+        const GetDesc gd = (GetDesc)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+        PWSTR w = nullptr;
+        if (gd && SUCCEEDED(gd(GetCurrentThread(), &w)) && w) {
+            char u[40]{};
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u - 1, nullptr, nullptr);
+            if (u[0]) snprintf(name, sizeof name, "%s", u);
+            LocalFree(w);
+        }
+    }
+    return name;
+}
+// ---- (stream R2) RX_VK_TL=<present>: a timeline of what the renderer's threads do over 3 frames from that present on (threads by
+// name, times in ms from the window's start): the submits and their replays, the CPU's event signals, the stops at event
+// waits, the presents and their drains, the fence waits, the readbacks with their waits. Logging only ----
+struct TlEv {
+    int64_t t;
+    const char* what;
+    uint64_t a, b, c;
+    char thread[24];
+};
+constexpr uint32_t kTlMax = 1 << 15;
+TlEv tl_ring[kTlMax];
+std::atomic<uint32_t> tl_n{0};
+std::atomic<int> tl_active{0};
+int64_t tl_from = -2;
+int64_t tl_t0 = 0;
+inline int64_t tl_now() { return std::chrono::steady_clock::now().time_since_epoch().count(); }
+// RX_VK_TL=<present>, or RX_VK_TL_S=<seconds after the first present> (the window opens at the first present after that)
+int64_t tl_start_ns = 0;
+bool tl_wanted() {
+    static const int64_t from = getenv("RX_VK_TL") ? atoll(getenv("RX_VK_TL")) : -1;
+    tl_from = from;
+    if (getenv("RX_VK_TL_S")) tl_start_ns = tl_now() + (int64_t)(atof(getenv("RX_VK_TL_S")) * 1e9);
+    return from >= 0 || tl_start_ns;
+}
+void tl_ev(const char* what, uint64_t a, uint64_t b, uint64_t c) {
+    if (!tl_active.load(std::memory_order_relaxed)) return;
+    const uint32_t i = tl_n.fetch_add(1);
+    if (i >= kTlMax) return;
+    TlEv& e = tl_ring[i];
+    e.t = tl_now(), e.what = what, e.a = a, e.b = b, e.c = c;
+    snprintf(e.thread, sizeof e.thread, "%s", rb_thread_label());
+}
+/// at the top of a present: opens the window at present `from`, writes it out 3 presents later
+inline void tl_ev(const char* what, uint64_t a = 0, uint64_t b = 0) { tl_ev(what, a, b, 0); }
+void tl_at_present(int64_t presents) {
+    static const bool want = tl_wanted();
+    if (!want) return;
+    if (tl_start_ns && tl_now() >= tl_start_ns) tl_from = presents, tl_start_ns = 0;
+    if (presents == tl_from && !tl_active.load()) tl_t0 = tl_now(), tl_n = 0, tl_active = 1;
+    if (presents == tl_from + 3 && tl_active.load()) {
+        tl_active = 0;
+        const uint32_t n = std::min<uint32_t>(tl_n.load(), kTlMax);
+        std::vector<uint32_t> ord(n);
+        for (uint32_t i = 0; i < n; i++) ord[i] = i;
+        std::sort(ord.begin(), ord.end(), [](uint32_t a, uint32_t b) { return tl_ring[a].t < tl_ring[b].t; });
+        logf("vk: tl begin (%u events from present %lld)", n, (long long)tl_from);
+        for (uint32_t i : ord) {
+            const TlEv& e = tl_ring[i];
+            logf("vk: tl %9.3f %-22s %-14s %#llx %#llx %#llx", (e.t - tl_t0) / 1e6, e.thread, e.what, (unsigned long long)e.a,
+                 (unsigned long long)e.b, (unsigned long long)e.c);
+        }
+        logf("vk: tl end");
+    }
+}
+} // namespace
 // (TICK-033, vk_draw.cpp: real occlusion counts, RX_VK_OCC_REAL) each draw and dispatch of the stream numbered in stream order: on
 // the replay thread (serial and dry passes) and on a segment's thread from the dry pass's number at its start
 extern thread_local int64_t occ_draw_slot;
@@ -333,6 +407,7 @@ void queue_flush_locked() {   // (dev.present_mu held)
     si.signalSemaphoreInfoCount = n;
     si.pSignalSemaphoreInfos = sig;
     PROF(PROF_QSUBMIT);
+    tl_ev("flush-submit", pend.cbs.size(), pend.signal, pend.rec);
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
     if (res == VK_SUCCESS && pend.any_signal) note_signal_sent(pend.signal);
     static int failures;
@@ -701,6 +776,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         late_hold = memory_late_fix_pending() && batch_tl != VK_NULL_HANDLE;
         if (late_hold) st_lf_held_cbs += n;
     }
+    tl_ev("rec-submit", seq, r.value, (uint64_t)(batch_on() || late_hold) | (uint64_t)late_hold << 1);
     if (batch_on() || late_hold) {
         if (pend.cbs.empty()) batch_next++, pend_since = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < n; i++) pend.cbs.push_back(cb[i]);
@@ -3192,60 +3268,6 @@ uint64_t replay_pin_mask() {
 #endif
 }
 thread_local int replay_pin_depth = 0;
-// ---- (stream R2) RX_VK_TL=<present>: a timeline of what the renderer's threads do over 3 frames from that present on (threads by
-// name, times in ms from the window's start): the submits and their replays, the CPU's event signals, the stops at event
-// waits, the presents and their drains, the fence waits, the readbacks with their waits. Logging only ----
-const char* rb_thread_label();
-struct TlEv {
-    int64_t t;
-    const char* what;
-    uint64_t a, b, c;
-    char thread[24];
-};
-constexpr uint32_t kTlMax = 1 << 15;
-TlEv tl_ring[kTlMax];
-std::atomic<uint32_t> tl_n{0};
-std::atomic<int> tl_active{0};
-int64_t tl_from = -2;
-int64_t tl_t0 = 0;
-inline int64_t tl_now() { return std::chrono::steady_clock::now().time_since_epoch().count(); }
-// RX_VK_TL=<present>, or RX_VK_TL_S=<seconds after the first present> (the window opens at the first present after that)
-int64_t tl_start_ns = 0;
-bool tl_wanted() {
-    static const int64_t from = getenv("RX_VK_TL") ? atoll(getenv("RX_VK_TL")) : -1;
-    tl_from = from;
-    if (getenv("RX_VK_TL_S")) tl_start_ns = tl_now() + (int64_t)(atof(getenv("RX_VK_TL_S")) * 1e9);
-    return from >= 0 || tl_start_ns;
-}
-inline void tl_ev(const char* what, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) {
-    if (!tl_active.load(std::memory_order_relaxed)) return;
-    const uint32_t i = tl_n.fetch_add(1);
-    if (i >= kTlMax) return;
-    TlEv& e = tl_ring[i];
-    e.t = tl_now(), e.what = what, e.a = a, e.b = b, e.c = c;
-    snprintf(e.thread, sizeof e.thread, "%s", rb_thread_label());
-}
-/// at the top of a present: opens the window at present `from`, writes it out 3 presents later
-void tl_at_present(int64_t presents) {
-    static const bool want = tl_wanted();
-    if (!want) return;
-    if (tl_start_ns && tl_now() >= tl_start_ns) tl_from = presents, tl_start_ns = 0;
-    if (presents == tl_from && !tl_active.load()) tl_t0 = tl_now(), tl_n = 0, tl_active = 1;
-    if (presents == tl_from + 3 && tl_active.load()) {
-        tl_active = 0;
-        const uint32_t n = std::min<uint32_t>(tl_n.load(), kTlMax);
-        std::vector<uint32_t> ord(n);
-        for (uint32_t i = 0; i < n; i++) ord[i] = i;
-        std::sort(ord.begin(), ord.end(), [](uint32_t a, uint32_t b) { return tl_ring[a].t < tl_ring[b].t; });
-        logf("vk: tl begin (%u events from present %lld)", n, (long long)tl_from);
-        for (uint32_t i : ord) {
-            const TlEv& e = tl_ring[i];
-            logf("vk: tl %9.3f %-22s %-14s %#llx %#llx %#llx", (e.t - tl_t0) / 1e6, e.thread, e.what, (unsigned long long)e.a,
-                 (unsigned long long)e.b, (unsigned long long)e.c);
-        }
-        logf("vk: tl end");
-    }
-}
 thread_local DWORD_PTR replay_pin_prev = 0;
 struct ReplayPin {
     bool counted = false;
@@ -3546,12 +3568,14 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
     }
     // (a batched submit holds its recordings' signal until the batch goes out: the readback wait in invalidate came here
     // without a flush, and the job that waited held up the main thread, so nothing flushed it: the load hang on RADV)
+    tl_ev("wait-rec+", f, seq, 0);
     queue_flush_for(FR_WAIT);
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
     wi.pSemaphores = &rec_timeline;
     wi.pValues = &seq;
     *ok = vkWaitSemaphores(dev.device, &wi, timeout_ns) == VK_SUCCESS;
+    tl_ev("wait-rec-", f, seq, 0);
     (void)completed();   // (RX_VK_POOL_MIRROR: the staged write-backs of what is done applied)
     return true;
 }
@@ -3805,24 +3829,6 @@ struct RbScope {
     void skip() { if (on) pt = now_ns(); }   // (time not charged to a phase)
     ~RbScope();
 };
-const char* rb_thread_label() {
-    thread_local char name[40];
-    thread_local bool have = false;
-    if (!have) {
-        have = true;
-        snprintf(name, sizeof name, "tid%lu", (unsigned long)GetCurrentThreadId());
-        typedef HRESULT(WINAPI * GetDesc)(HANDLE, PWSTR*);
-        const GetDesc gd = (GetDesc)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
-        PWSTR w = nullptr;
-        if (gd && SUCCEEDED(gd(GetCurrentThread(), &w)) && w) {
-            char u[40]{};
-            WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u - 1, nullptr, nullptr);
-            if (u[0]) snprintf(name, sizeof name, "%s", u);
-            LocalFree(w);
-        }
-    }
-    return name;
-}
 struct RbAgg {
     int64_t calls = 0, ever = 0, pending = 0, newest = 0, late = 0, ns_total = 0, ph[6] = {0, 0, 0, 0, 0, 0}, ns_max = 0;
     void add(const RbScope& s, int64_t total) {
