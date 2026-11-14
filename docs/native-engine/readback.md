@@ -82,6 +82,8 @@ here). Shots every 600 presents were kept in `build/s5/r2-fl-*-shots/` (local).
 | `RX_VK_READBACK_LATE=2000,40` | 98.3, 98.0, 98.2 | 98.2 | +0.6% (inside the spread) | 40.6, 28.7-53.0, 0, 0 events: right |
 | `WATCH_KICK=1` + `READBACK_LATE=2000,40` | 105.3, 105.1, 104.4 | 104.9 | +7.5%, +0.7 over the kick alone | not run (each alone is right) |
 | `RX_VK_NO_READBACK_WAIT=1` (the bound) | 115.5, 112.9 | 114.2 | +17% | 42.2, 27.8-67.7, **24 pulses**, frame-to-frame step up to 11 (0.5 in the baseline): wrong |
+| `RX_VK_POOL_MIRROR=1` (step 3) | 88.8, 89.0 (against 96.6, 97.6 in the same screen) | 88.9 | -8.5% | not run |
+| `WATCH_KICK=1` + `POOL_MIRROR=1` | 93.5, 94.6 | 94.0 | -3.2% (the kick still adds +5.7% on the mirrors) | not run |
 | (built, taken out) `RX_VK_WAIT_REC_SENT=1`: no flush before the wait for a recording already sent | 109.6 (one run) | | +12% | **177.7 mean, 245.9 max: burnt out to white**: wrong |
 
 Of the 12 runs of the first screen, two did not leave the title screen (0 frames measured, the game's present count stops at 39.4 s
@@ -123,6 +125,10 @@ makes the stall more likely.
   (signal, replay, present, next frame's CPU phase, signal). The replay stays serial: the replay of frame N cannot overlap the CPU phase
   of frame N+1, because frame N+1's readbacks wait for frame N's heavy GPU work, and its event signal, which the next replay waits for,
   comes after them.
+
+Step 3 (the replay's own work, 4.6 ms on the 3050: page hashing, mirror sync, the GPU-write diff): `RX_VK_POOL_MIRROR=1` makes the
+replay do more, not less, on this PC (a staging copy per pool fill and write-back: -8.5%, 2 runs against 2); it saves memory (its
+purpose), not replay time, and none of the three costs went away. The per-phase cost with it on was not measured.
 
 ## Switches built (all default off)
 
