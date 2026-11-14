@@ -96,6 +96,9 @@ const char* rb_thread_label() {
 // ---- (stream R2) RX_VK_TL=<present>: a timeline of what the renderer's threads do over 3 frames from that present on (threads by
 // name, times in ms from the window's start): the submits and their replays, the CPU's event signals, the stops at event
 // waits, the presents and their drains, the fence waits, the readbacks with their waits. Logging only ----
+// (RX_VK_RB_PROF: what wait_recorded spent, by this thread since the readback began: the flush's wait (the pending late fix and the
+// queue's lock), the recordings' timeline, and the readbacks whose recording was not known yet)
+thread_local int64_t rb_wr_ns[2] = {0, 0}, rb_wr_miss = 0;
 struct TlEv {
     int64_t t;
     const char* what;
@@ -3570,9 +3573,10 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
         std::lock_guard mk(rec_map_mu);
         const bool honest = sync_honest_on();
         auto it = honest ? value_end.find(f) : value_rec.find(f);
-        if (honest ? it == value_end.end() : it == value_rec.end()) return false;
+        if (honest ? it == value_end.end() : it == value_rec.end()) return rb_wr_miss++, false;
         seq = it->second;
     }
+    const int64_t wr0 = std::chrono::steady_clock::now().time_since_epoch().count();
     // (a batched submit holds its recordings' signal until the batch goes out: the readback wait in invalidate came here
     // without a flush, and the job that waited held up the main thread, so nothing flushed it: the load hang on RADV)
     {
@@ -3581,11 +3585,13 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
         tl_ev("wait-rec+", f, seq, rc);
     }
     queue_flush_for(FR_WAIT);
+    const int64_t wr1 = std::chrono::steady_clock::now().time_since_epoch().count();
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
     wi.pSemaphores = &rec_timeline;
     wi.pValues = &seq;
     *ok = vkWaitSemaphores(dev.device, &wi, timeout_ns) == VK_SUCCESS;
+    rb_wr_ns[0] += wr1 - wr0, rb_wr_ns[1] += std::chrono::steady_clock::now().time_since_epoch().count() - wr1;
     tl_ev("wait-rec-", f, seq, 0);
     (void)completed();   // (RX_VK_POOL_MIRROR: the staged write-backs of what is done applied)
     return true;
@@ -3833,6 +3839,7 @@ struct RbScope {
             if (a < base || a >= base + 0x30000000) continue;
             if (seen++ >= 2) w += snprintf(site + w, sizeof site - w, "%s%x", w ? "," : "", (unsigned)(a - base));
         }
+        rb_wr_ns[0] = rb_wr_ns[1] = 0, rb_wr_miss = 0;
         t0 = pt = now_ns();
     }
     static int64_t now_ns() { return std::chrono::steady_clock::now().time_since_epoch().count(); }
@@ -3841,8 +3848,9 @@ struct RbScope {
     ~RbScope();
 };
 struct RbAgg {
-    int64_t calls = 0, ever = 0, pending = 0, newest = 0, late = 0, ns_total = 0, ph[6] = {0, 0, 0, 0, 0, 0}, ns_max = 0;
+    int64_t calls = 0, ever = 0, pending = 0, newest = 0, late = 0, ns_total = 0, ph[6] = {0, 0, 0, 0, 0, 0}, ns_max = 0, wr[2] = {0, 0}, miss = 0;
     void add(const RbScope& s, int64_t total) {
+        wr[0] += rb_wr_ns[0], wr[1] += rb_wr_ns[1], miss += rb_wr_miss;
         calls++, ever += s.ever, pending += s.pending, newest += s.newest, late += s.late, ns_total += total;
         for (int i = 0; i < 6; i++) ph[i] += s.ph[i];
         ns_max = std::max(ns_max, total);
@@ -3878,10 +3886,11 @@ RbScope::~RbScope() {
     if (logged++ < 200) {
         auto line = [&](const char* what, const RbAgg& a) {
             logf("vk: rbprof %lld presents %s: %.1f calls/frame (%.1f with write-backs, %.1f pending, %.1f newest, %.1f late), %.2f ms/frame "
-                 "[ticket %.2f, catchup %.2f, recorded %.2f, gpu %.2f, strict %.2f, textures %.2f], max %.2f ms",
+                 "[ticket %.2f, catchup %.2f, recorded %.2f (flush %.2f, timeline %.2f, unknown %.1f/frame), gpu %.2f, strict %.2f, textures %.2f], max %.2f ms",
                  (long long)frames, what, a.calls / (double)frames, a.ever / (double)frames, a.pending / (double)frames,
                  a.newest / (double)frames, a.late / (double)frames, a.ns_total / 1e6 / frames, a.ph[0] / 1e6 / frames, a.ph[1] / 1e6 / frames,
-                 a.ph[2] / 1e6 / frames, a.ph[3] / 1e6 / frames, a.ph[4] / 1e6 / frames, a.ph[5] / 1e6 / frames, a.ns_max / 1e6);
+                 a.ph[2] / 1e6 / frames, a.wr[0] / 1e6 / frames, a.wr[1] / 1e6 / frames, a.miss / (double)frames, a.ph[3] / 1e6 / frames,
+                 a.ph[4] / 1e6 / frames, a.ph[5] / 1e6 / frames, a.ns_max / 1e6);
         };
         line("all", rb_prof_all);
         for (const auto& t : rb_prof_threads) line(t.first.c_str(), t.second);
