@@ -12,6 +12,9 @@
 // RX_VK_SHOT_EVERY-th one (default 300) there as a PNG.
 #include <algorithm>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <dlfcn.h>   // (jt_mark: hos_jt_mark_ext, looked up in the exe)
+#endif
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -70,7 +73,9 @@ void jt_mark(int kind, uint64_t v) {
         reinterpret_cast<void (*)(int, uint64_t)>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(nullptr), "hos_jt_mark_ext")));
     if (fn) fn(kind, v);
 #else
-    (void)kind, (void)v;
+    // (Linux: the exe exports it by name, nx2/build.py's --export-dynamic-symbol list; GetModuleHandle(nullptr) is no handle there)
+    static void (*const fn)(int, uint64_t) = reinterpret_cast<void (*)(int, uint64_t)>(dlsym(RTLD_DEFAULT, "hos_jt_mark_ext"));
+    if (fn) fn(kind, v);
 #endif
 }
 extern std::atomic<bool> movie_networks_slow;   // (vk_draw.cpp: the movie networks left out, issue 109)
