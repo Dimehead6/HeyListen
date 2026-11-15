@@ -89,6 +89,8 @@ screen. It costs some GPU time on cards that cull quickly, so it is off unless s
 | `HOOKSHOT_NO_UPDATE_CHECK=1` | No look for a newer release at the start |
 | `HOS_TRACE=1` | Every Horizon call logged, as `--trace` does |
 | `RX_BACKEND=<name>` | Unset or `vulkan`: `hookshot_vk.dll`; any other value but `eden`: the WebGPU renderer, when the exe was built with one |
+| `HOS_MEMINFO_OLD=1` | The used memory the game is told (`QueryMemoryInfo`, svc `GetInfo` 7 and 22) is the program and the system's share alone, as before. By default it adds the heap and the pages the game mapped through `AllocateMemoryPages`, at most the console's total (`hos_used_memory`, `host/hos_mem.c`): told less, the game kept mapping pages for its caches (7.9 GB in a long session). Ported from Longshot a4c77174 (#324). For A/B |
+| `HOS_PAGES_LIMIT=1` | A diagnostic: `AllocateMemoryPages` is refused past the console's total (heap and mapped pages), as on the console. Keep it off: the game retries a refused allocation forever |
 
 ### Input for scripted runs
 
