@@ -2026,7 +2026,7 @@ bool claim_hash_on() {
     static const bool on = [] {
         const char* e = getenv("RX_VK_CLAIM_HASH");
         const bool v = !e || atoi(e) != 0;   // (on by default: PC 3050, castle-move, 3 against 3: 31.6 -> 36.1 fps; =0: as before)
-        if (v && capture_hash_on()) logf("vk: a claimed capture copy makes the chunk hashes too (RX_VK_CLAIM_HASH)");
+        if (v) logf("vk: a claimed capture copy makes the chunk hashes too (RX_VK_CLAIM_HASH)");
         return v;
     }();
     return on;
