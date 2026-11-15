@@ -330,10 +330,12 @@ bool batch_on() {
 // and a read in the gap took the light meter's sums from an earlier submission: OoT's auto-exposure jumped, the whole picture
 // 8-15% brighter for ~16 frames (an RX 9070 XT in Kokiri: up to 99 pulses in 2 minutes with the CPU busy, 0 with the wait,
 // at no measurable cost). On NVIDIA's driver the pulses were not seen and the wait cost ~18% (an RTX 5070 in Kokiri, pull
-// request 6). So on by default with RADV only; RX_VK_READBACK_STRICT=0 / 1: off / on on any driver.
+// request 6). So on by default with RADV only (for the meter's sizes, below); RX_VK_READBACK_STRICT=0 / 1: off / all on any driver.
 // RX_VK_READBACK_STRICT=<hex size>[,<hex size>...] (any value but 0 and 1): only the ranges of exactly those sizes wait, the
 // others as with 0. The light meter's are 1040 and c0 (stream R2: 0x1040 x3 and 0xc0 a frame, from the ring helper f_80357060);
-// a stale meter is the pulse, the other rings (0x2000, 0x40) read a frame late gave a right picture (RX_VK_READBACK_LATE)
+// a stale meter is the pulse, the other rings (0x2000, 0x40) read a frame late gave a right picture (RX_VK_READBACK_LATE).
+// Unset on RADV the default is that list, not all: 1040,c0 stopped the pulses as 1 did (stream R2), and under 1 nearly all the
+// strict wait was on two 0x1b580 ranges of the slot scan f_80364080 (RX 9070 XT, Kokiri: 80.8 fps with 1040,c0, 69.1 with 1)
 bool readback_strict_wanted(uint64_t size) {
     struct Strict { bool all = false; readback_late::Rules sizes; };
     static const Strict s = [] {
@@ -344,13 +346,16 @@ bool readback_strict_wanted(uint64_t size) {
         if (dev.physical) vkGetPhysicalDeviceProperties2(dev.physical, &p2), radv = dp.driverID == VK_DRIVER_ID_MESA_RADV;
         const char* e = getenv("RX_VK_READBACK_STRICT");
         Strict r;
-        if (e && strcmp(e, "0") && strcmp(e, "1")) {
+        if (!e && radv) {
+            r.sizes = readback_late::parse("1040,c0");
+            logf("vk: readback waits for the write-back for the light meter's sizes 1040,c0 (RX_VK_READBACK_STRICT unset, RADV)");
+        } else if (e && strcmp(e, "0") && strcmp(e, "1")) {
             r.sizes = readback_late::parse(e);
             r.sizes.newest = false;   // (sizes only)
             logf("vk: readback waits for the write-back for %d sizes (RX_VK_READBACK_STRICT=%s)", (int)r.sizes.sizes.size(), e);
         } else {
-            r.all = e ? atoi(e) != 0 : radv;
-            logf("vk: readback waits for the write-back %s (RX_VK_READBACK_STRICT%s)", r.all ? "on" : "off", !e && radv ? ", on with RADV" : "");
+            r.all = e && atoi(e) != 0;
+            logf("vk: readback waits for the write-back %s (RX_VK_READBACK_STRICT%s)", r.all ? "on" : "off", e ? "" : " unset");
         }
         return r;
     }();
@@ -6416,6 +6421,7 @@ void fill_replay_table(MkwVkRenderer& t) {
         if (id == HOS_OPT_HDR_PEAK) return std::clamp(opts.hdr_peak, 400, 10000);
         if (id == HOS_OPT_HDR_WHITE) return std::clamp(opts.hdr_white, 80, 500);
         if (id == HOS_OPT_DISCORD) return opts.discord != 0;
+        if (id == HL_OPT_SKIP_TITLE) return opts.skip_title != 0;
         return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() && !dlss_full_scale() : id == 3 ? (dlss_full_scale() ? 10000 : resolution_scale()) : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
                id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 9 ? opts.rumble : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y : id == HOS_OPT_GYRO ? opts.gyro : id == HOS_OPT_GYRO_SENS_X ? opts.gyro_sens_x : id == HOS_OPT_GYRO_SENS_Y ? opts.gyro_sens_y : id == HOS_OPT_GYRO_INV_X ? opts.gyro_inv_x : id == HOS_OPT_GYRO_INV_Y ? opts.gyro_inv_y : id == HOS_OPT_GYRO_DEADZONE ? opts.gyro_deadzone :
                id == HOS_OPT_DLSS_JITTER_W || id == HOS_OPT_DLSS_JITTER_H || id == HOS_OPT_DLSS_JITTER_PHASES ? jitter_option(id) :

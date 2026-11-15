@@ -96,6 +96,8 @@ screen. It costs some GPU time on cards that cull quickly, so it is off unless s
 |---|---|
 | `HOS_INPUT_SCRIPT=<presses>` | Presses timed from the game's first controller read |
 | `HOS_INPUT_LIVE=<file>` | A file the test appends lines of presses to, read every 30 ms; each line's times count from when it is read. A line `!cheat <n>` sends a Cheats page action, `!synclog` logs the NVN syncs (`!dump`, `!shots`, `!rdoc` and `!flasharm` are the WebGPU renderer's) |
+| `HOS_INPUT_FROM_PLAY=1` | The script's times count from the moment play begins (the `play: began` line of the log: the player's first update) instead of the first controller read; nothing fires before. With `HL_SKIP_TITLE=1` a scene has the same inputs whatever the title and loading took |
+| `HL_SKIP_TITLE=0` or `1` | Skip title screen (the Gameplay row, saved as `skip_title_screen`; option id `HL_OPT_SKIP_TITLE`, `gpu/vk/vk_opt_ids.h`) for one run, wins over the row: A is pressed through the title and file list, from 20 s after the first controller read, every 2 s, until the player runs; with no save it does nothing |
 | `HOS_INPUT_FRAME_CLOCK=1` | The script's time runs at 60 game frames a second instead of the wall clock |
 | `HOS_INPUT_EXCLUSIVE`, `HOS_INPUT_BACKGROUND`, `HOS_INPUT_SCRIPT_BACKGROUND` (set) | As above; the last lets every device count while the window is behind another one |
 | `RX_VK_MENU_SCRIPT=<seconds>:<key>,...` | Timed Insert menu keys: `INS`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `ESC`, `ENTER`, `TABL`, `TABR` |
@@ -115,7 +117,7 @@ case-sensitive, and an unknown one is ignored.
 | `RX_VK_FLASH=1` | The flash detector, with `RX_VK_SHOTS` and `RX_VK_SHOT_EVERY=1`: writes the frames around a flash and dumps the next one |
 | `RX_VK_FRAMELOG=<file>` | Every frame shown, at 320x180, while `<file>.go` exists; `python -I scripts/framelog.py <file>` finds the flashes |
 | `RX_VK_DUMP=<present>[+<count>][,...]` | Every step of the frame after that present as PNGs, in `dump_<present>` under `RX_VK_DUMP_DIR` (or `RX_VK_SHOTS`, or the current folder); `RX_VK_DUMP_STEPS=<lo>-<hi>` and `RX_VK_DUMP_PROGS=<key>,...` narrow it |
-| `RX_VK_READBACK_STRICT=0`, `1` or `<hex size>,...` | Whether reads of GPU results (the light meter) wait for their write-back to land, not only for the recordings' timeline. A list of sizes makes only ranges of exactly those sizes wait: `1040,c0` is the light meter's, which stopped the pulses on RADV as `1` does (0 in 2 runs each against 52 and 23 with `0`) while waiting a few times less often. On by default with RADV, where without it the auto-exposure pulses (the whole picture brighter for ~16 frames) when the CPU is busy; off elsewhere (on NVIDIA it cost ~18% and no pulses were seen). Set `=1` in `hookshot_env.txt` if the picture pulses on another driver. `RX_VK_FRAMELOG` shows the pulses; `RX_VK_EXPOSURE_LOG`'s factor does not |
+| `RX_VK_READBACK_STRICT=0`, `1` or `<hex size>,...` | Whether reads of GPU results (the light meter) wait for their write-back to land, not only for the recordings' timeline. A list of sizes makes only ranges of exactly those sizes wait: `1040,c0` is the light meter's, which stopped the pulses on RADV as `1` does (0 in 2 runs each against 52 and 23 with `0`) while waiting a few times less often. With RADV the default is `1040,c0` (without it the auto-exposure pulses, the whole picture brighter for ~16 frames, when the CPU is busy; `1` waited mostly on two 0x1b580 ranges that are not the meter: 69 fps against 81 in Kokiri on an RX 9070 XT); off elsewhere (on NVIDIA it cost ~18% and no pulses were seen). Set `=1040,c0` (or `=1`) in `hookshot_env.txt` if the picture pulses on another driver. `RX_VK_FRAMELOG` shows the pulses; `RX_VK_EXPOSURE_LOG`'s factor does not |
 | `RX_VK_PASS_TRACE=1` | The passes of the last frames, logged at a flash or a dark frame (`RX_VK_PASS_TRACE_AT=<n>`: every n-th present) |
 | `RX_VK_PROBE=1` or `2` | The centre texel after every pass: `probe_<frame>.txt` at a flash (1), or `probe_all_<n>.txt` at speed (2); `python -I scripts/probe.py` reads them |
 | `RX_VK_DUMP_FAILED=<dir>` | The native code of every program that does not translate, for `nx2/lower_test.py` (game data: keep it local) |
@@ -203,7 +205,7 @@ number is not the obvious one:
 
 The other rows are 0 Off and 1 On. Some are read at the start, before the menu exists, by the code that needs them:
 `handheld_profile` and `output_res` (`host/nn_applet.c`), `ultrawide` (`host/hos_main.c`), `robust_buffers`
-(`gpu/vk/vk_main.cpp`) and the controls (`host/nn_hid.c`).
+(`gpu/vk/vk_main.cpp`), the controls (`host/nn_hid.c`) and `skip_title_screen` (`host/oot_autoload.c`).
 
 ## Layout
 
