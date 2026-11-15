@@ -1199,6 +1199,16 @@ struct ParPoint {
 };
 std::vector<ParPoint> par_points;   // (every 64 draws and dispatches of the dry pass)
 int64_t dry_work = 0;
+// (D4, issue 3: the one-frame black world in Zora's Domain) The dry pass marked the targets a draw writes (dry_mark_written) but not
+// those a clear writes. A pass that only clears its targets (two colour targets cleared and sampled by a later segment: the
+// 1280 x 720 scene targets) was marked as the GPU's only when the segment that holds the clear recorded it, and a later segment
+// that recorded first found the targets never written and uploaded stale guest memory over them, an upload that runs after the
+// clear: the targets black for the frame. The log's "written (a pass's colour target) in segment N, uploaded by the later segment M"
+// lines counted them (40 and more in a 4-minute run; none with RX_VK_PARALLEL=0). RX_VK_NO_DRY_CLEAR_MARKS=1: as before
+bool dry_clear_marks() {
+    static const bool on = !getenv("RX_VK_NO_DRY_CLEAR_MARKS");
+    return on;
+}
 // (TICK-061, D2/D3, RX_VK_DRY_LEAN=1) the points whose state the dry pass keeps: only those the boundaries can be at (see
 // lean_candidates in replay_handle); null: every point, as before
 struct LeanPoints {
@@ -2004,12 +2014,16 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             if (s.render_enabled && !dry) {
                 const auto c = payload<nvn_p_clear_color>(a, avail);
                 clear_color_target(cmd, s, c.index, c.rgba, (uint32_t)c.mask);
+            } else if (s.render_enabled && dry_clear_marks()) {
+                dry_mark_written(s, false, dry_work == 0);   // (D4: a clear writes its targets too: see dry_clear_marks)
             }
             break;
         case NOP_CLEAR_DS:
             if (s.render_enabled && !dry) {
                 const auto c = payload<nvn_p_clear_ds>(a, avail);
                 clear_depth_stencil(cmd, s, c.depth, c.depth_mask != 0, (uint32_t)c.stencil, (uint32_t)c.stencil_mask);
+            } else if (s.render_enabled && dry_clear_marks()) {
+                dry_mark_written(s, false, dry_work == 0);
             }
             break;
         case NOP_DRAW: {

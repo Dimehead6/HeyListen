@@ -3158,6 +3158,15 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
                  tex->layers, tex->nvn_format, (unsigned long long)(frame_no - 1), (unsigned long long)frame_no,
                  tex->released ? "finalized" : "live", (unsigned long long)kb, dirty.size(), gpu_dirty ? ", a GPU buffer wrote it" : "");
     }
+    if (tl_seg && tex->dry_value == rec_value) {   // (D4: uploaded in a segment although the dry pass marked it written)
+        static std::atomic<int64_t> n{0};
+        const int64_t k = ++n;
+        if (k <= 60 || k % 500 == 0)
+            logf("vk: parallel: #%u %#llx %ux%u x%u NVN %#x uploaded in segment %llu after the dry pass marked it written (gpu_written %d, "
+                 "released %d, uploaded %d, partial %d; %lld so)", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height,
+                 tex->layers, tex->nvn_format, (unsigned long long)tl_seg, (int)tex->gpu_written, (int)tex->released, (int)tex->uploaded,
+                 (int)partial, (long long)k);
+    }
     const auto up0 = std::chrono::steady_clock::now();
     const bool up_ok = upload(*tex, partial || sparse_written ? &dirty : nullptr);
     {   // (an upload over 15 ms: what it was, 60 of them)
@@ -3732,12 +3741,29 @@ int texture_flush_to_guest(uint64_t lo, uint64_t size) {
 void texture_written(Texture* tex, const char* why) {
     if (!tex) return;
     ledger_mark(tex->gpu, tex->guest_size, kUseRendered);   // (RX_VK_LEDGER)
+    static std::mutex dry_seen_mu;
+    static std::unordered_map<uint64_t, std::pair<uint32_t, uint64_t>> dry_seen;   // (D4: gpu address -> the texture the dry pass marked there, and when)
     if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) {   // (a parallel replay's order broken: see dry_mark_written)
         static int64_t n;
-        if (n++ < 40 || n % 500 == 0)
-            logf("vk: parallel: #%u %#llx %ux%u x%u NVN %#x written (%s) in segment %llu, uploaded by the later segment %llu (%lld so)",
+        if (n++ < 40 || n % 500 == 0) {
+            std::pair<uint32_t, uint64_t> seen{0, 0};
+            {
+                std::lock_guard lk(dry_seen_mu);
+                const auto it = dry_seen.find(tex->gpu);
+                if (it != dry_seen.end()) seen = it->second;
+            }
+            logf("vk: parallel: #%u %#llx %ux%u x%u NVN %#x written (%s) in segment %llu, uploaded by the later segment %llu (dry-marked %d; "
+                 "the dry pass last marked #%u there at value %llu, this one's value %llu; %lld so)",
                  tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->layers, tex->nvn_format, why ? why : "no reason",
-                 (unsigned long long)tl_seg, (unsigned long long)tex->upload_seg, (long long)n);
+                 (unsigned long long)tl_seg, (unsigned long long)tex->upload_seg, (int)(tex->dry_value == rec_value), seen.first,
+                 (unsigned long long)seen.second, (unsigned long long)rec_value, (long long)n);
+        }
+    }
+    if (why && !strncmp(why, "the dry pass", 12)) {
+        tex->dry_value = rec_value;
+        std::lock_guard lk(dry_seen_mu);
+        if (dry_seen.size() > 4096) dry_seen.clear();
+        dry_seen[tex->gpu] = {tex->id, rec_value};
     }
     vw_note(*tex);
     tex->only_cleared = false;
