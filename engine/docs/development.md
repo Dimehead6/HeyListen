@@ -82,7 +82,7 @@ screen. It costs some GPU time on cards that cull quickly, so it is off unless s
 | `HOS_AUDIO_NO_EFFECTS=1` | The audio effects (reverbs, delay, biquad filters on mixes and splitter destinations) are left out: the dry sound, to compare |
 | `HOS_AUDIO_NO_REVERB=1` | Only the reverbs left out |
 | `HOS_LANGUAGE=<code>` | The game's language for this run, a code from `language.txt` |
-| `HOS_OUTPUT_RES=<0..3>`, `HOS_HANDHELD=1`, `HOS_ASPECT=<ratio>` | Over the options file: the output resolution (0 2048x1152, 1 2560x1440, 2 3840x2160, 3 1920x1080), the handheld profile, a picture wider than 16:9 (2.3889 for 3440x1440) |
+| `HOS_OUTPUT_RES=<0..4>`, `HOS_HANDHELD=1`, `HOS_ASPECT=<ratio>` | Over the options file: the output resolution (0 2048x1152, 1 2560x1440, 2 3840x2160, 3 1920x1080, 4 5120x1440, or one of those sizes written out; any other value is logged and the game's size kept), the handheld profile, a picture wider than 16:9 (2.3889 for 3440x1440) |
 | `HOS_DYNRES=0`, `HOS_REALTIME_STEP=0`, `HOS_TEXT_SPEED=<0..3>` | Over the options file: Resolution 100% (non-zero: Auto), Game speed Per frame (1: Real time), Text speed |
 | `RX_VK_FRAMEGEN=0`, `RX_VK_FRAMEGEN_MULT=<2..8>`, `RX_VK_PACE=0`, `RX_VK_UPSCALE=<0..2>` | No frame generation whatever the menu says; over the options file: its multiplier, frame pacing, the upscaling filter |
 | `RX_VK_DEVICE=<n>` | The graphics card listed as `vk: device <n>` in the log, over the menu's GPU device |
@@ -140,6 +140,7 @@ case-sensitive, and an unknown one is ignored.
 |---|---|
 | `RX_VK_VALIDATION` (set) | The Khronos validation layer |
 | `RX_VK_CHECKPOINTS=0` | No NVIDIA checkpoints (on by default; after a lost device they name the draw it stopped at) |
+| `RX_VK_CHECKPOINTS=1` | Without the NVIDIA ones (AMD, Intel): VK_AMD_buffer_marker's markers, logged after a lost device and also once the GPU has finished none for `RX_VK_CHECKPOINTS_STALL_S` seconds (2; 0: only after the loss), so a ring that times out with no submission coming back still names the work |
 | `RX_VK_HANG_DUMP=<file>` | Every thread's stack to the file once no frame was shown for `RX_VK_HANG_SEC` seconds (20) (Windows) |
 | `RX_VK_NOOPT` (set) | Pipelines built without the driver's optimisations |
 | `RX_VK_SKIP_PROG=<prefix>,...` | Leaves out the draws of these programs (default `53509044401d78d2`; `-` leaves out none) |
@@ -186,7 +187,7 @@ number is not the obvious one:
 | `gpu_device` | 0 Auto, n the n-th card with Vulkan 1.3 as the row lists them |
 | `frame_generation` | 0 Off, 2 to 8 the multiplier |
 | `resolution` | 0 Auto, 1 100%, 2 75%, 3 67%, 4 50% |
-| `output_res` | 0 2048x1152, 1 2560x1440, 2 3840x2160, 3 1920x1080 |
+| `output_res` | 0 2048x1152, 1 2560x1440, 2 3840x2160, 3 1920x1080, 4 5120x1440 (or the size written out, `1920x1080`; no other size) |
 | `upscaling` | 0 Off, 1 Catmull-Rom, 2 Lanczos |
 | `sharpness`, `rumble_strength`, `motion_sensitivity_x`, `motion_sensitivity_y` | percent |
 | `mouse_sensitivity` | hundredths: 100 is 1.00 |
