@@ -2576,7 +2576,17 @@ void menu_tick() {
                 uint64_t vram = 0;
                 for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
                     if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram += mp.memoryHeaps[i].size;
-                perf_sampling(true, pr.deviceName, (float)(vram >> 20));
+                PerfGpuId id;   // (the card's sysfs node on Linux: amdgpu_stats.h)
+                id.vendor = pr.vendorID, id.device = pr.deviceID;
+                if (dev.pci_bus_info) {
+                    VkPhysicalDevicePCIBusInfoPropertiesEXT pci{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+                    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+                    p2.pNext = &pci;
+                    vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+                    id.has_pci = true;
+                    id.domain = pci.pciDomain, id.bus = pci.pciBus, id.dev = pci.pciDevice, id.function = pci.pciFunction;
+                }
+                perf_sampling(true, pr.deviceName, (float)(vram >> 20), &id);
             } else {
                 perf_sampling(false, nullptr, -1);
             }
