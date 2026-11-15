@@ -1483,15 +1483,114 @@ bool buf_unchanged(int32_t stage, int32_t index, uint64_t addr, uint64_t size, i
     return stage == nstage && index == nindex && addr == naddr && size == nsize;
 }
 
+// ---- (stream R4) RX_VK_PROF_FINE=1: what the replay thread's own time inside submissions is made of ----
+// "a frame (fine)" (vk_draw.cpp) sums the draw's sections over every recording thread; the parallel replay spreads them over up to five.
+// These are the wall clock of the thread that holds the replay lock, per frame (every 120): the submissions (and those with 300 draws
+// or more, the frame's heavy one in its pieces), the command buffers' replay_handle (its dry pass, its segments' wait, the command
+// buffers recorded whole on this thread), the memory work before a submission, the recording's end
+struct ReplayWall {
+    int64_t submit_ns = 0, submits = 0, draws = 0;
+    int64_t heavy_ns = 0, heavy_n = 0, heavy_draws = 0;
+    int64_t handle_ns = 0, handles = 0;
+    int64_t dry_ns = 0, seg_ns = 0, big = 0, whole_ns = 0, whole = 0;
+    int64_t mem_ns = 0, finish_ns = 0;
+};
+ReplayWall rwall;
+bool wall_fine_on() {
+    static const bool v = getenv("RX_VK_PROF_FINE") != nullptr;
+    return v;
+}
+inline int64_t wall_now() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+struct WallAdd {   // (adds its scope's wall time to a counter; nothing when the switch is off)
+    int64_t& acc;
+    int64_t t0;
+    explicit WallAdd(int64_t& a) : acc(a), t0(wall_fine_on() ? wall_now() : 0) {}
+    ~WallAdd() { if (t0) acc += wall_now() - t0; }
+    WallAdd(const WallAdd&) = delete;
+    WallAdd& operator=(const WallAdd&) = delete;
+};
+// (and the ops of the stream by kind: how many and how long each took in the dry pass, in a segment's recording and in a command buffer
+// recorded whole on one thread; an op's time runs to the start of the next, so a draw's includes the loop's own turn)
+constexpr int kOpKinds = 64;
+std::atomic<int64_t> op_cost_ns[3][kOpKinds], op_cost_n[3][kOpKinds];   // ([0] the dry pass, [1] a segment's worker, [2] the whole thread)
+const char* const kOpNames[kOpKinds] = {
+    "end", "jump", "begin", "call", "signal event", "report counter", "copy b2b", "update ub", "set rt", "clear color", "clear ds", "viewports",
+    "scissor", "depth range", "bind program", "bind state", "bind vattr", "bind vstream", "bind vbuf", "bind ubo", "bind ssbo", "bind tex",
+    "bind samp", "stencil", "poly offset", "draw", "draw idx", "dispatch", "barrier", "set tex pool", "set samp pool", "copy b2t",
+    "copy stride", "blend color", "copy t2b", "bind img", "copy t2t", "reset counter", "clear tex", "depth clamp", "render enable",
+    "raster discard", "render cond", "primitive restart", "bind bufs", "draw indirect", "dispatch indirect", "draw mesh", "wait event",
+    "push const", "clear buf", "ubo check", "ubo inline"};
+struct OpTimer {   // (one replay() call's: the sums go to the shared counters when it returns)
+    bool on;
+    int mode;
+    int64_t t_prev = 0;
+    uint32_t prev = 0;
+    int64_t ns[kOpKinds] = {}, n[kOpKinds] = {};
+    OpTimer(bool dry, bool worker) : on(wall_fine_on()), mode(dry ? 0 : worker ? 1 : 2) {}
+    void at(uint32_t op) {   // (the next op begins)
+        const int64_t now = prof_now();
+        if (t_prev && prev < kOpKinds) ns[prev] += now - t_prev, n[prev]++;
+        t_prev = now, prev = op;
+    }
+    ~OpTimer() {
+        if (!on) return;
+        at(0);
+        for (int i = 0; i < kOpKinds; i++)
+            if (n[i]) op_cost_ns[mode][i].fetch_add(ns[i], std::memory_order_relaxed), op_cost_n[mode][i].fetch_add(n[i], std::memory_order_relaxed);
+    }
+};
+void op_cost_report(double frames) {
+    static int64_t last_ns[3][kOpKinds], last_n[3][kOpKinds];
+    static const char* const where[3] = {"dry pass", "segment workers", "whole on one thread"};
+    for (int m = 0; m < 3; m++) {
+        struct Row { int op; double ms, n, us; };
+        std::vector<Row> rows;
+        double all = 0;
+        for (int i = 0; i < kOpKinds; i++) {
+            const int64_t ns = op_cost_ns[m][i].load(std::memory_order_relaxed), n = op_cost_n[m][i].load(std::memory_order_relaxed);
+            const int64_t dn = ns - last_ns[m][i], dc = n - last_n[m][i];
+            last_ns[m][i] = ns, last_n[m][i] = n;
+            if (dc <= 0) continue;
+            rows.push_back({i, dn / frames / 1e6, dc / frames, dn / 1e3 / (double)dc});
+            all += dn / frames / 1e6;
+        }
+        if (rows.empty()) continue;
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.ms > b.ms; });
+        char line[900];
+        int k = snprintf(line, sizeof line, "vk: a frame (fine, ops of the %s): %.2f ms in all:", where[m], all);
+        for (size_t i = 0; i < rows.size() && i < 9 && k < (int)sizeof line - 90; i++)
+            k += snprintf(line + k, sizeof line - k, " %s %.2f ms (%.0f, %.2f us)%s", kOpNames[rows[i].op], rows[i].ms, rows[i].n, rows[i].us,
+                          i + 1 < rows.size() && i < 8 ? "," : "");
+        logf("%s", line);
+    }
+}void replay_wall_report(double frames) {
+    if (!wall_fine_on()) return;
+    static ReplayWall last;
+    const ReplayWall& n = rwall;
+    const auto ms = [&](int64_t a, int64_t b) { return (a - b) / frames / 1e6; };
+    const auto per = [&](int64_t a, int64_t b) { return (a - b) / frames; };
+    logf("vk: a frame (fine, replay thread, wall): submissions %.2f ms (%.1f, %.0f draws); of them with 300 draws or more %.2f ms (%.2f, "
+         "%.0f draws); replay_handle %.2f ms (%.1f): dry pass %.2f, segments' recording and wait %.2f (%.2f big), recorded whole here %.2f "
+         "(%.1f); memory work %.2f, recordings ended %.2f",
+         ms(n.submit_ns, last.submit_ns), per(n.submits, last.submits), per(n.draws, last.draws), ms(n.heavy_ns, last.heavy_ns),
+         per(n.heavy_n, last.heavy_n), per(n.heavy_draws, last.heavy_draws), ms(n.handle_ns, last.handle_ns), per(n.handles, last.handles),
+         ms(n.dry_ns, last.dry_ns), ms(n.seg_ns, last.seg_ns), per(n.big, last.big), ms(n.whole_ns, last.whole_ns), per(n.whole, last.whole),
+         ms(n.mem_ns, last.mem_ns), ms(n.finish_ns, last.finish_ns));
+    last = n;
+    op_cost_report(frames);
+}
+
 void ubo_check_refs(uint32_t op, const uint8_t* a, uint32_t avail);   // (HL_UBO_CHECK: below)
 
 void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* end = nullptr) {
     const Mode mode = rmode;
     const bool dry = mode == Mode::Dry, worker = mode == Mode::Worker;
+    OpTimer op_timer(dry, worker);
     for (;;) {
         if (p == end) return;
         nvn_op_hdr h;
         std::memcpy(&h, p, sizeof h);
+        if (op_timer.on) op_timer.at(h.op);
         const uint8_t* a = p + 8;
         const uint32_t avail = h.size - 8;
         if (!worker && ubo_check_on()) ubo_check_refs(h.op, a, avail);
@@ -2632,6 +2731,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     static double dry_ms, seg_ms, segs_n, slow_ms, wait_ms, self_ms, early_n;
     static int64_t timed, whole_n;
     dry_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dry0).count();
+    if (wall_fine_on()) rwall.dry_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_dry0).count();
     const size_t used = open + 1;
     if (early)
         for (size_t k = used; k < jobs.size(); k++) texture_segment_end((int)k);   // (never reached: their init command buffers ended)
@@ -2644,7 +2744,11 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
         whole_n++;
         Segment whole = jobs[0]->g;
         whole.end = stop;
-        record_segment(cmd, whole);
+        {
+            WallAdd wall_whole(rwall.whole_ns);
+            rwall.whole++;
+            record_segment(cmd, whole);
+        }
         *cut = false;
         return occ_stop ? occ_go_on(cmd, occ_stop, may_stop, nullptr) : stop;
     }
@@ -2710,6 +2814,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     par_active = false;
     texture_segments_begin(nullptr, 0);
     seg_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_seg0).count();
+    if (wall_fine_on()) rwall.seg_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_seg0).count(), rwall.big++;
     segs_n += (double)used, early_n += (double)(used - 1);
     {
         int64_t hi = 0;
@@ -2771,7 +2876,11 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     suspend_at = nullptr;
     if (threads < 2 || !rec_cur || dump_on() || gprof_on() || probe_serial()) {
         suspend_ok = may_stop;
-        replay(cmd, state, h);
+        {
+            WallAdd wall_whole(rwall.whole_ns);
+            rwall.whole++;
+            replay(cmd, state, h);
+        }
         suspend_ok = false;
         return suspend_at;
     }
@@ -2908,6 +3017,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     static double dry_ms, seg_ms, segs_n;
     static int64_t timed;
     dry_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dry0).count();
+    if (wall_fine_on()) rwall.dry_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_dry0).count();
     const int nseg = mkwvk::segment_plan::segment_count(total, per, recorders, kMaxBatch, one_round);
     int64_t wants[kMaxBatch] = {};
     if (balance) mkwvk::segment_plan::balanced_targets(profile, nseg, total, wants);
@@ -2944,7 +3054,11 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     if (seg.size() > 1) pk_big_now |= 1ull << pk_this;
     if (presync_early.r) presync_early_finish(seg.size() > 1);   // (TICK-056: its copies ahead of rec_cur, on every path below)
     if (seg.size() == 1) {   // (one segment: here, as the dry pass left the reports and conditions)
-        record_segment(cmd, seg[0]);
+        {
+            WallAdd wall_whole(rwall.whole_ns);
+            rwall.whole++;
+            record_segment(cmd, seg[0]);
+        }
         return occ_stop ? occ_go_on(cmd, occ_stop, may_stop, nullptr) : stop;
     }
     if (!par_pool.started) {
@@ -3037,7 +3151,11 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         rec_parts++;
         Segment whole = seg[0];
         whole.end = stop;
-        record_segment(cmd, whole);
+        {
+            WallAdd wall_whole(rwall.whole_ns);
+            rwall.whole++;
+            record_segment(cmd, whole);
+        }
         return occ_stop ? occ_go_on(cmd, occ_stop, may_stop, nullptr) : stop;
     }
     texture_segments_begin(inits.data(), inits.size());
@@ -3151,6 +3269,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     par_active = false;
     texture_segments_begin(nullptr, 0);
     seg_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_seg0).count();
+    if (wall_fine_on()) rwall.seg_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_seg0).count(), rwall.big++;
     segs_n += (double)seg.size();
     static double wait_ms, locks_n;
     {
@@ -3331,6 +3450,7 @@ struct SlowWatch {
 /// The memory work before a submission's recording: the pools mapped, its capture taken, the other writes collected
 /// (replay_mu held). In the order of the submits: one behind its queue's stopped one (submit_job) has it done as it comes.
 void submit_memory_work(uint64_t value) {
+    WallAdd wall_mem(rwall.mem_ns);
     PROF(PROF_MEMSYNC);
     jt_mark(15, value);
     struct JtEnd { ~JtEnd() { jt_mark(16, 0); } } jt_end;
@@ -3554,6 +3674,23 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     ReplayPin pin;
     SlowWatch slow("submit");
     PROF(PROF_SUBMIT);
+    struct WallSubmit {   // (RX_VK_PROF_FINE: this submission's wall time and draws, in the frame's counters)
+        int64_t t0 = 0, d0 = 0;
+        WallSubmit() {
+            if (!wall_fine_on()) return;
+            int64_t sk, di, pl;
+            draw_stats(&d0, &sk, &di, &pl);
+            t0 = wall_now();
+        }
+        ~WallSubmit() {
+            if (!t0) return;
+            const int64_t dt = wall_now() - t0;
+            int64_t d1, sk, di, pl;
+            draw_stats(&d1, &sk, &di, &pl);
+            rwall.submit_ns += dt, rwall.submits++, rwall.draws += d1 - d0;
+            if (d1 - d0 >= 300) rwall.heavy_ns += dt, rwall.heavy_n++, rwall.heavy_draws += d1 - d0;
+        }
+    } wall_submit;
     if (lag_on()) lag_poll_late(), lag_run_start(value);   // (RX_VK_LAG_LOG)
     if (memory_work) {
         if (frame_submits.empty()) frame_first_value = value;
@@ -3579,7 +3716,11 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     const uint8_t* stop = nullptr;
     for (; cb < n; cb++, p = nullptr) {
         if (!handles[cb]) continue;
-        stop = replay_handle(cmd, p ? p : reinterpret_cast<const uint8_t*>(handles[cb]), may_stop);
+        {
+            WallAdd wall_handle(rwall.handle_ns);
+            rwall.handles++;
+            stop = replay_handle(cmd, p ? p : reinterpret_cast<const uint8_t*>(handles[cb]), may_stop);
+        }
         if (stop) break;
     }
     if (stop) {
@@ -3601,7 +3742,10 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         rec_open_values.push_back(value);
         if (queue && rec_timeline) rec_open_qvalues.push_back(value);   // (TICK-058: value_queue has it: submit_q)
     }
-    if (!burst_open) finish_recording(value);   // (a burst's: at its end)
+    if (!burst_open) {   // (a burst's: at its end)
+        WallAdd wall_finish(rwall.finish_ns);
+        finish_recording(value);
+    }
     if (stop) return false;
     if (pushed.load() < value) pushed = value;
     st_submits++;
@@ -4799,6 +4943,7 @@ void log_frame_stats() {
              (st_ub_overlays - l_ubo) / 120.0, (st_wait_ns - l_wait) / 120.0 / 1e6, (long long)pl, pms,
              (long long)tr, (long long)fl, texture_count(), (unsigned long long)(texture_bytes() >> 20));
         draw_skip_report(120.0);
+        replay_wall_report(120.0);
         {   // (hookshot: the full barriers recorded and the ones left out as the second of two in a row, RX_VK_BARRIER_DEDUPE_OFF=1)
             static int64_t l_made, l_left;
             int64_t made = 0, left = 0;
