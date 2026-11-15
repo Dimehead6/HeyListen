@@ -430,13 +430,8 @@ def run(args: argparse.Namespace) -> dict:
         raise SystemExit(f"{exe} is already running: refusing to start a second instance of this game folder")
     # (2026-11-09: a scripted walk left the area, the game autosaved and the user's own save was overwritten) the run must leave
     # the saves exactly as they were: copied before, put back after
-    save_dir = next((d for d in save_dirs(exe) if d.is_dir()), None)
-    save_copy = out / "save-guard"
-    if save_dir is not None and not os.environ.get("BENCH_KEEP_GAME_SAVES"):
-        shutil.rmtree(save_copy, ignore_errors=True)
-        shutil.copytree(save_dir, save_copy)
-    else:
-        save_dir = None
+    # (every folder the game may save to: on Linux the data folder and, after a failed move, user/ beside the exe)
+    guarded = [] if os.environ.get("BENCH_KEEP_GAME_SAVES") else guard_saves(save_dirs(exe), out / "save-guard")
     log = log_path.open("wb")
     try:
         dog.start()
@@ -474,11 +469,10 @@ def run(args: argparse.Namespace) -> dict:
             time.sleep(1)
         if instances(exe):
             warnings.append(f"{image} still running after the run")
-        elif save_dir is not None:   # (only once no game can write them any more)
-            shutil.rmtree(save_dir, ignore_errors=True)
-            shutil.copytree(save_copy, save_dir)
-        if save_dir is not None and instances(exe):
-            warnings.append(f"saves NOT restored (game still running): the copy is in {save_copy}")
+        elif guarded:   # (only once no game can write them any more)
+            warnings += restore_saves(guarded)
+        if guarded and instances(exe):
+            warnings.append(f"saves NOT restored (game still running): the copies are in {out / 'save-guard'}")
     wall = time.monotonic() - started
     if dog.fired:
         warnings.append("hard watchdog fired")
@@ -578,13 +572,47 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def save_dirs(exe: Path) -> list[Path]:
-    """Where the game keeps its saves: user/save beside the exe (Windows), else the Linux data folder
-    ($XDG_DATA_HOME/hookshot/save, by default ~/.local/share/hookshot/save)."""
+    """Every folder the game may keep its saves in; the run guards each one that exists.
+
+    user/save beside the exe (Windows; on Linux when started with an image path, or when the move below left the saves
+    there), and on Linux the data folder of engine/host/hos_main.c saves_dir: $XDG_DATA_HOME/heylisten/save when
+    XDG_DATA_HOME is an absolute path, else ~/.local/share/heylisten/save. Builds before the HeyListen names used
+    .../hookshot/save (nothing moves those), so that one is guarded too.
+    """
     dirs = [exe.parent / "user" / "save", exe.parent.parent / "user" / "save"]
     if os.name != "nt":
-        data = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-        dirs.append(Path(data) / "hookshot" / "save")
+        xdg = os.environ.get("XDG_DATA_HOME", "")
+        data = Path(xdg) if xdg.startswith("/") else Path.home() / ".local" / "share"
+        dirs += [data / "heylisten" / "save", data / "hookshot" / "save"]
     return dirs
+
+
+def guard_saves(dirs: list[Path], copies: Path) -> list[tuple[Path, Path]]:
+    """Copies every existing save folder of dirs into copies/<n>; the (folder, copy) pairs for restore_saves."""
+    shutil.rmtree(copies, ignore_errors=True)
+    guarded, seen = [], set()
+    for d in dirs:
+        key = os.path.realpath(d)
+        if key in seen or not d.is_dir():
+            continue
+        seen.add(key)
+        copy = copies / str(len(guarded))
+        shutil.copytree(d, copy, symlinks=True)
+        (copies / f"{len(guarded)}.txt").write_text(str(d) + "\n", encoding="utf-8")
+        guarded.append((d, copy))
+    return guarded
+
+
+def restore_saves(guarded: list[tuple[Path, Path]]) -> list[str]:
+    """Puts every guarded save folder back as it was copied; the warnings (a folder that could not be put back)"""
+    warnings = []
+    for d, copy in guarded:
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+            shutil.copytree(copy, d, symlinks=True)
+        except OSError as e:
+            warnings.append(f"saves in {d} NOT restored ({e}): the copy is in {copy}")
+    return warnings
 
 
 def instance_pids(exe: Path) -> list[int]:

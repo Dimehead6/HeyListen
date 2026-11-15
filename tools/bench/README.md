@@ -11,8 +11,12 @@ Runs one build, collects per-frame present intervals, writes `<dir>/bench.json`
 (plus the raw `present_trace.csv` / `presentmon.csv` and `game_log.txt`).
 Exit code 0 when frames were recorded, 2 when none were.
 
-On Linux, `--exe` is the game folder's `hookshot`; the saves the run guards (copied before, put back after) are
-`$XDG_DATA_HOME/hookshot/save` (`~/.local/share/hookshot/save`), and the running check uses `pgrep -x`.
+On Linux, `--exe` is the game folder's `hookshot`, and the running check uses `pgrep -x`. The run guards (copies
+into `<dir>/save-guard/<n>` before, puts back after) every save folder the game may write that exists: `user/save`
+beside the exe (and one folder up), and on Linux the game's data folder, `$XDG_DATA_HOME/heylisten/save` (when
+`XDG_DATA_HOME` is an absolute path, as `engine/host/hos_main.c` reads it; else `~/.local/share/heylisten/save`), and
+`.../hookshot/save`, where builds before the HeyListen names saved. `<dir>/save-guard/<n>.txt` names each copy's folder.
+`BENCH_KEEP_GAME_SAVES=1` turns the guard off.
 
 `--repeat N` (TICK-009) runs N launches back to back into `<dir>/run1` .. `run<N>`
 (each with its own watchdog, the game killed before the next one starts) and writes
@@ -163,4 +167,6 @@ PresentMon's present intervals on the host swap chain, not guest (Switch) frames
 `python -m pytest -q tools/bench` - parsers on sample files in `testdata/`, the warm-up and
 launch-offset logic, the fps spread, `summarize.py` on synthetic directories, the
 watchdog, the 1% / 0.1% low fps and the 120 / 144 / 60 Hz budget shares on synthetic traces,
-and end-to-end runs (`--repeat 2` included) against a fake game process. No real game is started.
+the save folders guarded and put back,
+and end-to-end runs (`--repeat 2` included) against a fake game process. No real game is started, and the tests use a
+data folder of their own (`XDG_DATA_HOME`), never the user's saves.

@@ -13,6 +13,13 @@ DATA = Path(__file__).parent / "testdata"
 SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
 
 
+@pytest.fixture(autouse=True)
+def _own_machine(tmp_path, monkeypatch):
+    """No test touches the user's saves (the guard copies and puts back the real data folder otherwise): the data
+    folder is the test's own."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+
 def test_percentile_and_stats():
     s = rb.compute_stats([10.0] * 98 + [20.0, 100.0])
     ft = s["frame_time_ms"]
@@ -349,3 +356,54 @@ def test_summarize_new_columns_on_synthetic_traces(tmp_path, capsys):
     assert "| 1.0% | 100.0% | 1% |" in row
     # 1% low and 0.1% low: the single 40 ms frame -> 25.0 fps
     assert "| 25.0 | 25.0 |" in row
+
+
+# ------------------------------------------------------ the saves the run guards (Linux: the data folder)
+@pytest.mark.skipif(sys.platform == "win32", reason="the Linux data folder")
+def test_save_dirs_are_the_games(tmp_path, monkeypatch):
+    exe = tmp_path / "game" / "hookshot"
+    # (host/hos_main.c saves_dir: $XDG_DATA_HOME/heylisten when it is absolute, else ~/.local/share/heylisten)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    dirs = rb.save_dirs(exe)
+    assert dirs[:2] == [tmp_path / "game" / "user" / "save", tmp_path / "user" / "save"]
+    assert tmp_path / "xdg" / "heylisten" / "save" in dirs
+    assert tmp_path / "xdg" / "hookshot" / "save" in dirs   # (builds before the HeyListen names)
+    monkeypatch.setenv("XDG_DATA_HOME", "relative/data")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    dirs = rb.save_dirs(exe)
+    assert tmp_path / "home" / ".local" / "share" / "heylisten" / "save" in dirs
+    assert not any("relative" in str(d) for d in dirs)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the Linux data folder")
+def test_run_puts_every_save_folder_back(tmp_path):
+    """A game that overwrites a save in the data folder and one beside it, and adds one: all as before after the run."""
+    data_save = tmp_path / "xdg" / "heylisten" / "save" / "0100"
+    data_save.mkdir(parents=True)
+    (data_save / "slot0").write_bytes(b"the user's own save")
+    game_dir = tmp_path / "game"
+    beside = game_dir / "user" / "save"
+    beside.mkdir(parents=True)
+    (beside / "old").write_text("kept beside", encoding="utf-8")
+    game = tmp_path / "fake_game.py"
+    game.write_text(
+        "import os, time\n"
+        "d = os.path.join(os.environ['XDG_DATA_HOME'], 'heylisten', 'save', '0100')\n"
+        "open(os.path.join(d, 'slot0'), 'wb').write(b'autosaved over')\n"
+        "open(os.path.join(d, 'slot1'), 'wb').write(b'new')\n"
+        "open(os.path.join('user', 'save', 'old'), 'w').write('changed')\n"
+        "f = open(os.environ['HOS_PRESENT_TRACE'], 'w')\n"
+        "f.write('frame,return_ns,interval_ns\\n')\n"
+        "for i in range(1, 100000):\n"
+        "    f.write('%d,%d,%d\\n' % (i, i * 10000000, 0 if i == 1 else 10000000)); f.flush(); time.sleep(0.01)\n")
+    exe = game_dir / "hookshot.sh"
+    exe.write_text('#!/bin/sh\nexec "%s" "%s"\n' % (sys.executable, game))
+    exe.chmod(0o755)
+    out = tmp_path / "out"
+    assert rb.main(["--exe", str(exe), "--build", "hookshot", "--scene", "kokiri-idle", "--out", str(out),
+                    "--duration", "2", "--warmup-s", "0"]) == 0
+    assert (data_save / "slot0").read_bytes() == b"the user's own save"
+    assert not (data_save / "slot1").exists()
+    assert (beside / "old").read_text(encoding="utf-8") == "kept beside"
+    assert sorted(p.name for p in (out / "save-guard").iterdir()) == ["0", "0.txt", "1", "1.txt"]
+
