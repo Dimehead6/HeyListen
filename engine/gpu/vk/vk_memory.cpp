@@ -4834,7 +4834,7 @@ std::vector<PresyncNote> presync_notes;   // (this submission's presync, checked
 thread_local bool in_presync = false;
 // (TICK-056, RX_VK_PRESYNC_STATS=1, diagnosis) the pre-syncs' work: pages looked at and dirty ones, pools synced, time, logged
 // every 600 pre-syncs that copied anything
-struct PresyncScan { int64_t pages = 0, dirty = 0, loop_ns = 0, lazy_ns = 0, cap_pages = 0, live_pages = 0; };
+struct PresyncScan { int64_t pages = 0, dirty = 0, loop_ns = 0, lazy_ns = 0, cap_pages = 0, live_pages = 0, scan_ns = 0, diff_ns = 0, gpu_ns = 0; };
 thread_local PresyncScan presync_scan;
 bool presync_stats_on() {
     static const bool v = getenv("RX_VK_PRESYNC_STATS") && atoi(getenv("RX_VK_PRESYNC_STATS")) != 0;
@@ -4907,7 +4907,9 @@ int64_t mirror_sync(Pool& p) {
     const uint64_t page_end = (p.hi + 4095) >> kPageShift;
     for (uint64_t page = p.lo >> kPageShift; page < page_end;) {
         if (fast) {   // (TICK-056: straight to the next dirty page; the pages skipped are those the loop leaves alone)
+            const auto sc0 = pstats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             page = next_dirty_page(page, page_end, p.synced_gen);
+            if (pstats) presync_scan.scan_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - sc0).count();
             if (page >= page_end) break;
         } else if (page % kRegionPages == 0 && region_gen[page / kRegionPages] <= p.synced_gen) {
             page += kRegionPages;   // (a clean 2 MB region)
@@ -4978,6 +4980,7 @@ int64_t mirror_sync(Pool& p) {
                         s.mid = 0;   // (copied whole below, in a segment or cut: the shadow does not say what the mirror holds)
                     }
                     uint32_t mask = gm8 != 0xff ? gran_chunk_mask(gm8) : 0xffff;   // (TICK-048: the chunks to copy; sprint 5: the granules)
+                    const auto df0 = pstats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     if (dmode) {
                         // (TICK-060) a late slot whose fix is pending: its bytes are not yet the ones the GPU will copy: whole, no hash
                         const bool late_pending = late_fix_slot_pending(e.gen, e.slot, nullptr);
@@ -5013,6 +5016,7 @@ int64_t mirror_sync(Pool& p) {
                             d_void(page);
                         }
                     }
+                    if (pstats) presync_scan.diff_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - df0).count();
                     int64_t copied = 0;
                     std::vector<VkBufferCopy>& cr = fast && last_runs && last_runs_buf == b->second.buffer ? *last_runs : cap_runs[b->second.buffer];
                     if (fast) last_runs = &cr, last_runs_buf = b->second.buffer;
@@ -6289,9 +6293,10 @@ void memory_sync_mirrors_before_segments() {
     scatter_flush(upload_command_buffer(), "msync scatter (CPU pages -> mirrors, one dispatch)");
     if (stats && bytes_all) {
         const auto t3 = std::chrono::steady_clock::now();
-        static int64_t n, s_pools, s_synced, s_pages, s_dirty, s_bytes, s_entries, s_loop, s_lazy, s_capb, s_liveb;
+        static int64_t n, s_pools, s_synced, s_pages, s_dirty, s_bytes, s_entries, s_loop, s_lazy, s_capb, s_liveb, s_scanns, s_diffns;
         static double s_lock, s_scan, s_flush, s_max;
         s_loop += presync_scan.loop_ns, s_lazy += presync_scan.lazy_ns, s_capb += presync_scan.cap_pages, s_liveb += presync_scan.live_pages;
+        s_scanns += presync_scan.scan_ns, s_diffns += presync_scan.diff_ns;
         using ms = std::chrono::duration<double, std::milli>;
         n++, s_pools += pools, s_synced += synced, s_pages += presync_scan.pages, s_dirty += presync_scan.dirty, s_bytes += bytes_all;
         s_entries += (int64_t)entries, s_lock += ms(t1 - t0).count(), s_scan += ms(t2 - t1).count(), s_flush += ms(t3 - t2).count();
@@ -6299,10 +6304,10 @@ void memory_sync_mirrors_before_segments() {
         if (n == 600) {
             logf("vk: pre-sync (RX_VK_PRESYNC_STATS), a pre-sync with copies: pools %.1f (synced %.1f), pages looked at %.0f, dirty %.0f, "
                  "%.2f MB (%.2f from captures, %.2f live), %.0f scatter entries; ms: lock %.3f, pools %.3f (their page loops %.3f, the "
-                 "write-back notes %.3f), scatter %.3f, worst %.2f", s_pools / 600.0, s_synced / 600.0,
+                 "write-back notes %.3f; the dirty-page scan %.3f, the chunk diff %.3f), scatter %.3f, worst %.2f", s_pools / 600.0, s_synced / 600.0,
                  s_pages / 600.0, s_dirty / 600.0, s_bytes / 600.0 / 1048576.0, s_capb / 600.0 / 1048576.0, s_liveb / 600.0 / 1048576.0,
-                 s_entries / 600.0, s_lock / 600, s_scan / 600, s_loop / 600e6, s_lazy / 600e6, s_flush / 600, s_max);
-            n = s_pools = s_synced = s_pages = s_dirty = s_bytes = s_entries = s_loop = s_lazy = s_capb = s_liveb = 0;
+                 s_entries / 600.0, s_lock / 600, s_scan / 600, s_loop / 600e6, s_lazy / 600e6, s_scanns / 600e6, s_diffns / 600e6, s_flush / 600, s_max);
+            n = s_pools = s_synced = s_pages = s_dirty = s_bytes = s_entries = s_loop = s_lazy = s_capb = s_liveb = s_scanns = s_diffns = 0;
             s_lock = s_scan = s_flush = s_max = 0;
         }
     }

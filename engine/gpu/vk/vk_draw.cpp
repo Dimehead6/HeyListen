@@ -152,7 +152,7 @@ void fine_report(double frames) {
     k = snprintf(line, sizeof line, "vk: a frame (fine): %.0f draws; a draw:", draws / frames);
     for (int i = 1; i < FC_COUNT; i++) {
         k += snprintf(line + k, sizeof line - k, " %s %.2f%s", kFineC[i], (fine_n[i] - last_n[i]) / draws, i + 1 < FC_COUNT ? "," : "");
-        if (k > (int)sizeof line - 80) {
+        if (k > 700) {
             logf("%s", line);
             k = snprintf(line, sizeof line, "vk: a frame (fine): a draw:");
         }
