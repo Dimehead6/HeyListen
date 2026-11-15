@@ -2977,13 +2977,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         const int nplan = mkwvk::segment_plan::segment_count(last_total, per, recorders, kMaxBatch, one_round);
         if (nplan >= 2) {
             int64_t plan[kMaxBatch] = {};
-            static const double skew = [] {   // (stream R4, RX_VK_SEG_SKEW=<0..1>: see segment_plan.h balanced_targets; 0: equal parts, as before)
-                const char* e = getenv("RX_VK_SEG_SKEW");
-                const double v = e ? std::clamp(atof(e), 0.0, 1.0) : 0.0;
-                if (v > 0) logf("vk: early segments: later ones shorter, skew %.2f (RX_VK_SEG_SKEW)", v);
-                return v;
-            }();
-            mkwvk::segment_plan::balanced_targets(pk_profile[pk_this], nplan, last_total, plan, skew);
+            mkwvk::segment_plan::balanced_targets(pk_profile[pk_this], nplan, last_total, plan);
             int64_t total_now = 0;
             bool cut = false;
             const uint8_t* const ret = replay_handle_early(cmd, h, may_stop, nplan, plan, self_help, pk_profile[pk_this], &total_now, &cut);

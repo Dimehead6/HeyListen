@@ -60,24 +60,18 @@ inline void profile_add(Profile& p, const double* from, const double* to, const 
     p.valid = true;
 }
 
-/// The n-1 boundaries (in draws and dispatches, out[0..n-2]) that cut the profile's time into n parts; even counts when the profile has
-/// nothing yet. skew 0: equal parts. Else part k (0 first) is 1 + skew * ((n - 1) / 2 - k) / (n - 1) of an equal one, so the first is the
-/// longest and the last the shortest: the segments are handed out as the dry pass passes their ends, so a later one starts later, and the
-/// last, recorded by the replay thread once the dry pass is done, starts last of all; equal parts left the workers idle while it recorded
-inline void balanced_targets(const Profile& p, int n, int64_t total, int64_t* out, double skew = 0.0) {
+/// The n-1 boundaries (in draws and dispatches, out[0..n-2]) that cut the profile's time into n equal parts; even counts when
+/// the profile has nothing yet
+inline void balanced_targets(const Profile& p, int n, int64_t total, int64_t* out) {
     if (n < 2) return;
     double sum = 0;
     for (int i = 0; i < kBins; i++) sum += p.valid && p.ms[i] > 0 ? p.ms[i] : 0;
-    double weight_sum = 0;
-    for (int k = 0; k < n; k++) weight_sum += 1.0 + skew * ((n - 1) / 2.0 - k) / (n - 1);
-    double weight_cum = 0;
     for (int k = 1; k < n; k++) {
-        weight_cum += 1.0 + skew * ((n - 1) / 2.0 - (k - 1)) / (n - 1);
         if (sum <= 0) {
             out[k - 1] = total * k / n;
             continue;
         }
-        const double want = sum * weight_cum / weight_sum;
+        const double want = sum * k / n;
         double cum = 0, pos = 1;
         for (int i = 0; i < kBins; i++) {
             const double d = p.ms[i] > 0 ? p.ms[i] : 0;

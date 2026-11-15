@@ -76,20 +76,5 @@ int main() {
         balanced_targets(r, 3, 900, out);
         CHECK("still even", out[0] == 300 && out[1] == 600);
     }
-    {   // (RX_VK_SEG_SKEW: later parts shorter; 0 is the equal parts)
-        Profile p;
-        int64_t out[5] = {}, flat[5] = {};
-        const double f1[4] = {0, .25, .5, .75}, t1[4] = {.25, .5, .75, 1}, m1[4] = {1, 1, 1, 1};
-        profile_add(p, f1, t1, m1, 4, 0.25);
-        balanced_targets(p, 5, 1000, flat, 0.0);
-        CHECK("skew 0: even parts", flat[0] == 200 && flat[1] == 400 && flat[2] == 600 && flat[3] == 800);
-        balanced_targets(p, 5, 1000, out, 0.45);
-        const int64_t a = out[0], b = out[1] - out[0], c = out[2] - out[1], d = out[3] - out[2], e = 1000 - out[3];
-        CHECK("skew: each part shorter than the one before", a > b && b > c && c > d && d > e);
-        CHECK("skew: the first is about 1.22 of an equal one, the last 0.78", a > 235 && a < 252 && e > 150 && e < 165);
-        Profile none;
-        balanced_targets(none, 5, 1000, out, 0.45);
-        CHECK("no profile yet: even counts whatever the skew", out[0] == 200 && out[3] == 800);
-    }
     std::puts("segment plan: all checks passed");
 }
