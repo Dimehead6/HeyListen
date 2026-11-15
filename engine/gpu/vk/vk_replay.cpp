@@ -1494,6 +1494,7 @@ struct ReplayWall {
     int64_t handle_ns = 0, handles = 0;
     int64_t dry_ns = 0, seg_ns = 0, big = 0, whole_ns = 0, whole = 0;
     int64_t mem_ns = 0, finish_ns = 0;
+    int64_t early_ns[10] = {};   // (replay_handle_early's steps, EarlyWall)
 };
 ReplayWall rwall;
 bool wall_fine_on() {
@@ -1509,7 +1510,20 @@ struct WallAdd {   // (adds its scope's wall time to a counter; nothing when the
     WallAdd(const WallAdd&) = delete;
     WallAdd& operator=(const WallAdd&) = delete;
 };
-// (and the ops of the stream by kind: how many and how long each took in the dry pass, in a segment's recording and in a command buffer
+/// replay_handle_early's steps, each timed to the mark at its end (marks 1 to 8 in the order they come; the destructor, mark 9, adds
+/// each gap to the step of the mark that closes it, the marks a path does not reach left out)
+struct EarlyWall {
+    int64_t at[10] = {};
+    EarlyWall() { if (wall_fine_on()) at[0] = wall_now(); }
+    void mark(int i) { if (at[0]) at[i] = wall_now(); }
+    ~EarlyWall() {
+        if (!at[0]) return;
+        at[9] = wall_now();
+        int64_t prev = at[0];
+        for (int i = 1; i < 10; i++)
+            if (at[i]) rwall.early_ns[i] += at[i] - prev, prev = at[i];
+    }
+};// (and the ops of the stream by kind: how many and how long each took in the dry pass, in a segment's recording and in a command buffer
 // recorded whole on one thread; an op's time runs to the start of the next, so a draw's includes the loop's own turn)
 constexpr int kOpKinds = 64;
 std::atomic<int64_t> op_cost_ns[3][kOpKinds], op_cost_n[3][kOpKinds];   // ([0] the dry pass, [1] a segment's worker, [2] the whole thread)
@@ -1565,6 +1579,17 @@ void op_cost_report(double frames) {
     }
 }void replay_wall_report(double frames) {
     if (!wall_fine_on()) return;
+    static int64_t last_early[10];
+    {
+        static const char* const step[10] = {"", "memory sync before", "readback refresh", "segment recordings begun", "init buffers begun",
+                                             "dry loop", "what came before submitted", "its own segment", "waits and submits", "the end"};
+        char line[500];
+        int k = snprintf(line, sizeof line, "vk: a frame (fine, replay_handle_early's steps, ms):");
+        for (int i = 1; i < 10; i++)
+            k += snprintf(line + k, sizeof line - k, " %s %.2f%s", step[i], (rwall.early_ns[i] - last_early[i]) / frames / 1e6, i < 9 ? "," : "");
+        for (int i = 0; i < 10; i++) last_early[i] = rwall.early_ns[i];
+        logf("%s", line);
+    }
     static ReplayWall last;
     const ReplayWall& n = rwall;
     const auto ms = [&](int64_t a, int64_t b) { return (a - b) / frames / 1e6; };
@@ -2611,6 +2636,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     NvnState& state = *cur_state;
     presync_kick_at = 0;   // (the pre-sync is made here, before the dry pass)
     occ_stop_at = nullptr;
+    EarlyWall early_wall;
     const auto t_dry0 = std::chrono::steady_clock::now();
     const size_t ub0 = ub_updates.size();
     par_points.clear(), par_conds.clear(), dry_work = 0;
@@ -2619,7 +2645,9 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     end_pass(r.cmd);
     full_barrier(r.cmd);
     memory_sync_mirrors_before_segments();   // (rec_cur's uploads, before the dry pass: ahead of every segment)
+    early_wall.mark(1);
     texture_rb_refresh_now();                // (the part's readback refresh, in r: before any segment's)
+    early_wall.mark(2);
     jt_mark(19, 0);
     const uint64_t base = ++par_seq;
     par_seq += (uint64_t)nplan;
@@ -2647,6 +2675,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
         j->index = k;
         jobs.push_back(std::move(j));
     }
+    early_wall.mark(3);
     std::vector<VkCommandBuffer> inits;
     {
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -2660,6 +2689,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     }
     const bool early = inits.size() == jobs.size();   // (else: no segment, the dry pass then the whole here, below)
     if (early) texture_segments_begin(inits.data(), inits.size());
+    early_wall.mark(4);
     jt_mark(21, 0);
     std::condition_variable seg_cv;
     std::mutex seg_mu;
@@ -2723,6 +2753,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     suspend_ok = false;
     rmode = Mode::Serial;
     seg_early_hook = nullptr;
+    early_wall.mark(5);
     ub_growing.store(false, std::memory_order_release);   // (nothing is appended from here on)
     const uint8_t* const occ_stop = suspend_at ? nullptr : occ_stop_at;
     const uint8_t* const stop = suspend_at ? suspend_at : occ_stop;
@@ -2757,10 +2788,12 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     last->g.end = stop;
     submit_recording(r, false);   // (what came before, its uploads with the pre-sync: ahead of every segment in the queue)
     jt_mark(20, 0);
+    early_wall.mark(6);
     const auto t_seg0 = std::chrono::steady_clock::now();
     jt_mark(17, used);
     record_job(last);   // (the replay thread's: the last one)
     jt_mark(18, 0);
+    early_wall.mark(7);
     bool init_lost = false;
     int64_t pt_wait_ns = 0;
     for (size_t k = 0; k < used; k++) {   // (in order, each as soon as it is done)
@@ -2811,6 +2844,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     if (init_lost)
         replay_fatal("a parallel replay segment's init command buffer could not be ended: new images lost their first layout "
                      "change, and the work after it may use them");
+    early_wall.mark(8);
     par_active = false;
     texture_segments_begin(nullptr, 0);
     seg_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_seg0).count();
