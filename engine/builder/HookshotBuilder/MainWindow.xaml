@@ -185,7 +185,7 @@
                       Content="NVIDIA DLSS (downloads NVIDIA's SDK under NVIDIA's license)"/>
             <TextBlock Style="{StaticResource Note}" FontSize="12" Margin="26,4,0,0" TextWrapping="Wrap"
                        Text="For NVIDIA RTX graphics cards. NVIDIA's files stay on this PC: never share a game folder built with them."/>
-            <!-- exeFS (code) mods: nx2/exefs_mods.py patches the game's code before the translation; make_game.py --code-mods -->
+            <!-- exeFS (code) mods: nx2/exefs_mods.py patches the game's code before the translation; make_game.py's code-mods option -->
             <CheckBox x:Name="CodeModsTick" Style="{StaticResource Tick}" IsChecked="False" Margin="0,14,0,0" Click="CodeModsChanged"
                       Content="Code mods (exeFS): apply the patches found in the mods folder"/>
             <StackPanel Orientation="Horizontal" Margin="26,4,0,0">
