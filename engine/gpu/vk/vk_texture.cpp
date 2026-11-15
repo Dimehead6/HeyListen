@@ -4318,10 +4318,31 @@ void texture_frame(uint64_t completed) {
         const uint64_t over = pressure - allowed / 10 * 9;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
     }
-    if (known && !by_blocks && used > allowed / 100 * 97) {
-        const uint64_t over = used - allowed / 100 * 97;
+    // (longshot #404) an integrated GPU's line is lower: its heap is the PC's RAM, with nowhere to page to, so past the allowance
+    // the driver's own allocations fail. A UHD Graphics (7.0 GB allowed) at 6.7 GB entered Hyrule Castle, its imports grew by
+    // 560 MB, graphics pipelines were not made (-2) and the next indirect dispatch faulted inside Intel's driver; 3% of the
+    // allowance is 215 MB of room, 10% is 717. Dedicated cards keep 97%, where the driver pages instead
+    static const uint64_t line_pct = dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 90 : 97;
+    const uint64_t count_line = allowed / 100 * line_pct;
+    if (known && !by_blocks && used > count_line) {
+        const uint64_t over = used - count_line;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
     }
+    // (longshot #404) and pipelines the driver refused for want of memory since the last look (guarded_graphics_held,
+    // guarded_compute_held count them): the count's excess over its line, 256 MB at least, whatever the count said. The count is
+    // read every 10 frames (3 s at an integrated GPU's 3.5 fps); the refusals say it sooner
+    static int64_t refusals_seen = 0;
+    const int64_t refusals = st_driver_out_of_memory.load(std::memory_order_relaxed);
+    if (refusals != refusals_seen && known && !by_blocks) {
+        const uint64_t over = std::max<uint64_t>(used > count_line ? used - count_line : 0, 256ull << 20);
+        budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
+        static int told;
+        if (told++ < 8)
+            logf("vk: the driver refused %lld pipeline(s) for want of memory (%llu MB used of %llu allowed): the textures give up %llu MB",
+                 (long long)(refusals - refusals_seen), (unsigned long long)(used >> 20), (unsigned long long)(allowed >> 20),
+                 (unsigned long long)(over >> 20));
+    }
+    refusals_seen = refusals;
     // (TICK-023) from what the driver allows (VK_EXT_memory_budget), less a margin: the whole process held to
     // RX_VK_VRAM_TARGET_PCT of it (80), the textures getting what the rest (mirrors, pools, pipelines, streams, swapchain and the
     // free space VMA's blocks hold) leaves. A 12 GB card ran at 9.8 of 10.9 GB allowed with the textures at 5.6 GB under the

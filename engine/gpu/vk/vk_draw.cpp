@@ -882,6 +882,19 @@ bool pcache_fetch_lock_on() {
     }();
     return on;
 }
+/// (issue 496) compute pipelines built one at a time, on a thread of their own (jobs_push_serial): Intel's by default.
+/// RX_VK_COMPUTE_SERIAL=1 or 0 says so on any GPU
+bool serial_builds_on() {
+    static const bool on = getenv("RX_VK_COMPUTE_SERIAL") ? getenv("RX_VK_COMPUTE_SERIAL")[0] == '1' : dev.props.vendorID == 0x8086;
+    return on;
+}
+/// (longshot #404) On Intel's one-at-a-time builds a dispatch's first pipeline is made without the optimizer, the optimized one
+/// after it (compute_optimize). RX_VK_COMPUTE_QUICK_FIRST=0 builds the optimized one only, as before; =1 does it wherever builds
+/// are one at a time (RX_VK_COMPUTE_SERIAL)
+bool intel_quick_compute() {
+    static const bool on = !getenv("RX_VK_COMPUTE_QUICK_FIRST") || atoi(getenv("RX_VK_COMPUTE_QUICK_FIRST")) != 0;
+    return on;
+}
 thread_local int pcache_fetch_depth = 0;   // (a fetch inside a fetch on the same thread)
 constexpr int kFetchPollMs = 2000;    // (the background save's patience, polled)
 constexpr int kFetchPutOffs = 3;      // (saves put off in a row before the next one queues)
@@ -927,13 +940,29 @@ struct PcacheUse {
     PcacheUse& operator=(const PcacheUse&) = delete;
 };
 /// (the guards with the cache held from a fetch)
+/// (longshot #404) A pipeline the driver refused for want of memory (VK_ERROR_OUT_OF_DEVICE_MEMORY or _HOST_MEMORY), counted:
+/// texture_frame gives textures up when the count grows (st_driver_out_of_memory)
+VkResult note_out_of_memory(VkResult r) {
+    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_OUT_OF_HOST_MEMORY)
+        st_driver_out_of_memory.fetch_add(1, std::memory_order_relaxed);
+    return r;
+}
 VkResult guarded_graphics_held(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     PcacheUse use(cache);
-    return guarded_graphics(cache, ci, pl);
+    return note_out_of_memory(guarded_graphics(cache, ci, pl));
 }
 VkResult guarded_compute_held(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     PcacheUse use(cache);
-    return guarded_compute(cache, ci, pl);
+    return note_out_of_memory(guarded_compute(cache, ci, pl));
+}
+/// (longshot #404) Before play on Intel's one-at-a-time builds (the prepare's warm pass, precompile_run): ci asked without the
+/// optimizer, the pipeline a dispatch's first build asks for, so that a dispatch finds it in the cache. With the optimizer one of
+/// the game's compute pipelines took Intel's compiler up to 389.5 s on a UHD Graphics (i3-1115G4). true: asked so (the optimized
+/// build is then owed to the program's first dispatch)
+bool precompile_compute_quick(VkComputePipelineCreateInfo& ci) {
+    if (!serial_builds_on() || !intel_quick_compute() || (ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) return false;
+    ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    return true;
 }
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1,
                           bool* cold = nullptr);
@@ -3074,6 +3103,7 @@ struct Pushed {
 };
 TLS_OBJECT(pushed, std::array<Pushed, 2>)   // [graphics, compute]
 } // namespace
+std::atomic<int64_t> st_driver_out_of_memory{0};
 void draw_skip_report(double frames) { skip_report_impl(frames), fine_report(frames); }
 void descriptors_disturbed() {
     pushed()[0].cmd = pushed()[1].cmd = VK_NULL_HANDLE;
@@ -7559,6 +7589,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
         pin_subgroup(ci.stage, p.workgroup[0]);
         ci.layout = p.layout;
         if (getenv("RX_VK_NOOPT")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        precompile_compute_quick(ci);   // (Intel's one-at-a-time builds: without the optimizer, as a dispatch's first)
         VkPipeline pl = VK_NULL_HANDLE;
         // (into the app's pipeline cache, saved to mkw_vk_pipelines.bin: without it the next start compiled them again in play
         // where the driver's own cache missed them, AMD's 15 s culling compiles each time)
@@ -7809,10 +7840,12 @@ void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
                 pin_subgroup(ci.stage, p.workgroup[0]);
                 ci.layout = p.layout;
                 VkPipeline made = VK_NULL_HANDLE;
+                const bool quick = precompile_compute_quick(ci);
                 if (guarded_compute_held(pcache, &ci, &made) != VK_SUCCESS) made = VK_NULL_HANDLE;
                 if (made) {
                     p.compute_pipeline = made;
-                    cs_module_release(p);   // (TICK-038)
+                    if (quick) p.optimize_owed.store(true, std::memory_order_release);   // (its module stays for compute_optimize)
+                    else cs_module_release(p);   // (TICK-038)
                     p.compute_state.store(2, std::memory_order_release);
                 } else {
                     p.compute_state.store(0, std::memory_order_release);   // (a dispatch makes its own, and says why it fails)
@@ -7911,6 +7944,39 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     logf("vk: predicted %zu pipelines from %zu notes for %zu program variants no note names: %zu made in %.1f s%s", predicted.size(),
          notes.size(), programs, made.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
          out_of_time.load() ? " (the time budget, RX_VK_PREDICT_S, ran out: the rest are built in play)" : "");
+}
+
+/// (longshot #404) Intel's one-at-a-time compute builds (serial_builds_on): a dispatch's pipeline is made first without the
+/// optimizer (intel_quick_compute, RX_VK_COMPUTE_QUICK_FIRST), then with it here, behind the builds queued first. With the
+/// optimizer Intel's compiler took 0.3 s to 6.5 min for each of 37 of the game's dispatches on a UHD Graphics (i3-1115G4), 22
+/// minutes on its one thread, each pass over the scene (its light, its exposure) left out until its turn. The dispatch binds this
+/// one once made; the first stays for the session (a recording may hold it). The program's module, kept for this, goes after it
+void compute_optimize(Program& q) {
+    struct Release { Program& q; ~Release() { cs_module_release(q); } } release{q};
+    if (q.failed || q.stages.empty() || !q.stages[0].module || !q.layout) return;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = q.stages[0].module;
+    ci.stage.pName = "main";
+    pin_subgroup(ci.stage, q.workgroup[0]);
+    ci.layout = q.layout;
+    const auto t0 = std::chrono::steady_clock::now();
+    VkPipeline made = VK_NULL_HANDLE;
+    if (const VkResult r = guarded_compute_held(pcache, &ci, &made); r != VK_SUCCESS || !made) {
+        static std::atomic<int> told{0};
+        if (told++ < 20)
+            logf("vk: compute pipeline of %016llx: the optimized build was not made (%d); the one without the optimizer stays",
+                 (unsigned long long)q.key, (int)r);
+        return;
+    }
+    q.compute_optimized.store(made, std::memory_order_release);
+    pcache_built_since_save++;
+    st_pipelines++;
+    const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    static std::atomic<int> told{0};
+    if (ms >= 200 || told++ < 20)
+        logf("vk: compute pipeline of %016llx: optimized in %lld ms, bound from now on", (unsigned long long)q.key, (long long)ms);
 }
 
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
@@ -8031,9 +8097,8 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         if (fresh) {
             { ParLock lk; pcache_init(); }
             const Program* job = &p;
-            // (issue 496: one at a time on Intel. RX_VK_COMPUTE_SERIAL=1 or 0 says so on any GPU)
-            static const bool serial = getenv("RX_VK_COMPUTE_SERIAL") ? getenv("RX_VK_COMPUTE_SERIAL")[0] == '1'
-                                                                     : dev.props.vendorID == 0x8086;
+            // (issue 496: one at a time on Intel: serial_builds_on)
+            static const bool serial = serial_builds_on();
             auto build = [job] {
                 Program& q = const_cast<Program&>(*job);
                 VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -8045,6 +8110,9 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                 ci.layout = q.layout;
                 static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
                 if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+                // (longshot #404) on Intel's one-at-a-time builds, without the optimizer first: compute_optimize
+                const bool quick = serial && intel_quick_compute() && !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT);
+                if (quick) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
                 const auto t0 = std::chrono::steady_clock::now();
                 VkPipeline made = VK_NULL_HANDLE;
                 // (TICK-038) whether the pipeline cache had it: a hit is not a reason to write the 1 GB cache file again
@@ -8059,10 +8127,13 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                     q.failed = true;
                 } else {
                     q.compute_pipeline = made;
-                    cs_module_release(q);   // (TICK-038)
+                    if (quick) jobs_push_serial([job] { compute_optimize(const_cast<Program&>(*job)); });   // (keeps its module)
+                    else cs_module_release(q);   // (TICK-038)
                 }
                 const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-                if (ms >= 200) logf("vk: compute pipeline of %016llx: SLOW compile, %lld ms (on a worker)", (unsigned long long)q.key, (long long)ms);
+                if (ms >= 200)
+                    logf("vk: compute pipeline of %016llx: SLOW compile, %lld ms (on a worker%s)", (unsigned long long)q.key, (long long)ms,
+                         quick ? ", without the optimizer" : "");
                 st_pipeline_us += ms * 1000;
                 st_pipelines++;
                 // (NVIDIA leaves the hit bit clear even for what it had: a build under 30 ms is taken as one, the lazy compute
@@ -8074,7 +8145,9 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                 if (!hit) pcache_built_since_save++;
                 q.compute_state.store(2, std::memory_order_release);
             };
-            if (serial) jobs_push_serial(std::move(build));
+            // (first: a dispatch is a pass over the scene (its light, its exposure), left out while it builds; the mesh fallback's
+            // are a model each, and the optimized builds of earlier dispatches go behind both)
+            if (serial) jobs_push_serial(std::move(build), true);
             else jobs_push(std::move(build), true);
         }
         // (only the dispatch that started the build waits: later ones while it still compiles are left out at once, not 50 ms
@@ -8184,9 +8257,15 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (!p.compute_pipeline) SKIP_HERE();
     dump_ssbos(cmd, p, "before");
-    if (res_log_on()) res_note_pipeline_use(p.compute_pipeline);   // (TICK-038)
+    if (p.optimize_owed.load(std::memory_order_relaxed) && p.optimize_owed.exchange(false, std::memory_order_acq_rel)) {
+        Program* q = &p;   // (made without the optimizer before play: precompile_run)
+        jobs_push_serial([q] { compute_optimize(*q); });
+    }
+    const VkPipeline optimized = p.compute_optimized.load(std::memory_order_acquire);   // (compute_optimize)
+    const VkPipeline bound = optimized ? optimized : p.compute_pipeline;
+    if (res_log_on()) res_note_pipeline_use(bound);   // (TICK-038)
     if (!p.dispatched.exchange(true, std::memory_order_relaxed)) compute_note(p.key);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.compute_pipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bound);
     if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) SKIP_HERE();
     push_constants(cmd, p, nullptr);
     gprof_begin(cmd);
@@ -8488,13 +8567,33 @@ bool pcache_save_mapped(const std::string& tmp, size_t n) {
 #endif
 }
 
+// (longshot #404) a save put off for builds under way, owed to the serial builds' thread (pipeline_cache_between_builds), and
+// that thread's save there
+std::atomic<bool> pcache_save_owed{false};
+thread_local bool pcache_save_between = false;
+/// (longshot #404) Intel's compute builds are one at a time (jobs_push_serial), and its compiler took 30 s to 6.5 minutes on some
+/// of the game's compute programs on a UHD Graphics: one build or another was under way the whole of a 15-minute run, the queued
+/// fetch's 10 s never found a moment without one, and every save in play was put off. Between two of the serial thread's builds
+/// the save runs there: no compute build is under way, and the graphics builds it queues behind take milliseconds
+void pipeline_cache_between_builds() {
+    if (!pcache_save_owed.exchange(false)) return;
+    pcache_save_between = true;
+    struct Done { ~Done() { pcache_save_between = false; } } done;
+    pipeline_cache_save(false);
+}
 void pipeline_cache_save(bool force) {
-    if (!pcache || (!force && pcache_built_since_save < 32)) return;
+    const bool between = pcache_save_between;
+    if (!pcache || (!force && !between && pcache_built_since_save < 32)) return;
     const int64_t built = pcache_built_since_save.exchange(0);
     // (on a thread of its own unless forced, at exit: ~100 MB fetched and written took the replay thread 100+ ms at
     // each scene change; the cache is internally synchronized, pipelines go on being built meanwhile)
     static std::atomic<bool> busy{false};
     if (busy.exchange(true)) {
+        if (between) {   // (a background save under way: owed again, for after the next build)
+            pcache_built_since_save += built;
+            pcache_save_owed = true;
+            return;
+        }
         if (!force) {
             pcache_built_since_save += built;   // (still to save)
             return;
@@ -8502,14 +8601,14 @@ void pipeline_cache_save(bool force) {
         while (busy.load()) Sleep(1);   // (the one under way, then this one)
         busy = true;
     }
-    auto save = [force, built] {
+    auto save = [force, between, built] {
         struct Done { ~Done() { busy = false; } } done;
         // (Intel: no build under way while the cache's data is fetched, PcacheFetch. A forced save waits for the builds; the
         // background one polls, and is put off when builds ran throughout; after kFetchPutOffs of those in a row it queues for
         // kFetchQueueMs, so a stretch of back-to-back builds cannot put it off for good. The mapped write holds the lock across
         // its one fetch into the file's pages; the vector path fetches under it and writes outside it)
         static std::atomic<int> put_off{0};
-        const bool queue = force || put_off.load() >= kFetchPutOffs;
+        const bool queue = force || between || put_off.load() >= kFetchPutOffs;
         const int wait_ms = force ? -1 : queue ? kFetchQueueMs : kFetchPollMs;
         bool had = true;
         auto fetch = [&](size_t* n, void* data) {
@@ -8520,8 +8619,10 @@ void pipeline_cache_save(bool force) {
         const auto put_off_now = [&] {
             const int times = ++put_off;
             if (times <= 4 || times % 16 == 0)
-                logf("vk: pipeline cache save put off (%d in a row): pipelines were being built throughout", times);
+                logf("vk: pipeline cache save put off (%d in a row): pipelines were being built throughout%s", times,
+                     serial_builds_on() ? "; owed to the serial builds' thread, between two of its builds" : "");
             pcache_built_since_save += built;   // (still to save: the next request writes them, not only after 32 more)
+            if (serial_builds_on()) pcache_save_owed = true;
         };
         try {
             size_t n = 0;
@@ -8561,7 +8662,7 @@ void pipeline_cache_save(bool force) {
             logf("vk: pipeline cache save failed: %s", e.what());
         }
     };
-    if (force) save();
+    if (force || between) save();
     else {
         try {
             std::thread(save).detach();

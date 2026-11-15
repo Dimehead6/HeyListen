@@ -144,6 +144,7 @@ case-sensitive, and an unknown one is ignored.
 | `RX_VK_HANG_DUMP=<file>` | Every thread's stack to the file once no frame was shown for `RX_VK_HANG_SEC` seconds (20) (Windows) |
 | `RX_VK_NOOPT` (set) | Pipelines built without the driver's optimisations |
 | `RX_VK_PCACHE_FETCH_LOCK=0/1` | A pipeline cache's data is fetched (`vkGetPipelineCacheData`) only with no pipeline build under way (Intel's Windows driver crashes otherwise); the background save is put off to the next request when builds run throughout. Default: on for Intel (vendor 0x8086) under Windows, off elsewhere; `1` forces it on any GPU |
+| `RX_VK_COMPUTE_QUICK_FIRST=0/1` | On one-at-a-time compute builds (Intel by default, `RX_VK_COMPUTE_SERIAL`): a dispatch's first pipeline is made without the optimizer and the optimized one after it, on the back lane; the prepare and the precompile ask for the first. Default `1`; `0`: one optimized build, as before |
 | `RX_VK_SKIP_PROG=<prefix>,...` | Leaves out the draws of these programs (default `53509044401d78d2`; `-` leaves out none) |
 | `RX_VK_PIPE_SKIP=0` | A draw whose pipeline is not ready waits for it, instead of being left out when its targets hold an earlier frame |
 | `RX_VK_PRECOMPILE=0` or `1` | The shader preparation before the title off or on (on in builds made with `RX_RELEASE=1`, as the builders' are) |

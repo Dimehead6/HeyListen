@@ -106,6 +106,9 @@ void pcache_log_save(const char*, std::size_t, std::uint64_t, std::uint64_t, std
 
 // (vk_draw.cpp PcacheFetch: on Intel the fetch waits for the builds under way; none here)
 constexpr int kFetchPollMs = 2000, kFetchPutOffs = 3, kFetchQueueMs = 10000;
+std::atomic<bool> pcache_save_owed{false};   // (vk_draw.cpp: a save put off, owed to the serial builds thread)
+thread_local bool pcache_save_between = false;
+bool serial_builds_on() { return false; }
 struct PcacheFetch {
     explicit PcacheFetch(int, bool = true) {}
     bool held() const { return true; }
