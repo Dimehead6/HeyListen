@@ -333,9 +333,26 @@ def inspect(mod, ids):
     return rows, others
 
 
-def apply_mods(exefs, root, say=print):
+def _note_changed(out, mo, old, new, mod):
+    """the runs of bytes of new that differ from old, at module offset mo, as (lo, hi, mod) in out (a patch that writes what is
+    there already changes nothing, so it touches no function)"""
+    i = 0
+    while i < len(new):
+        if old[i] == new[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(new) and old[j] != new[j]:
+            j += 1
+        out.append((mo + i, mo + j, mod))
+        i = j
+
+
+def apply_mods(exefs, root, say=print, ranges=None):
     """Patch the modules in exefs with every enabled mod under root. Returns the patches applied: [(mod, file, module, records, bytes)].
-    Raises PatchError (the first problem, with the mod's name) and changes nothing then"""
+    ranges, a dict given in, is filled with what was written: {module: [(lo, hi, mod name)]} in the module's own addresses (file
+    offset - 0x100), the bytes that differ from before only. Raises PatchError (the first problem, with the mod's name) and changes
+    nothing then"""
     ids = module_ids(exefs)
     plan = {}      # module file -> {offset: (value, source)}
     writes = []    # (module file, offset, bytes, source)
@@ -390,6 +407,8 @@ def apply_mods(exefs, root, say=print):
                 raise PatchError("%s writes outside %s: 0x%x..0x%x is not inside its .text, .rodata or .data (the module's address range "
                                  "is %s)" % (src, module, mo, mo + len(value), ", ".join("0x%x..0x%x" % (s[0], s[0] + len(s[1])) for s in m.segs)))
             seg, i = where
+            if ranges is not None:
+                _note_changed(ranges.setdefault(module, []), mo, seg[1][i:i + len(value)], value, src.split("/")[0] if "/" in src else src)
             seg[1][i:i + len(value)] = value
     for module, m in loaded.items():
         m.write()
@@ -448,3 +467,46 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# --- the list the engine reads ------------------------------------------------------------------------------------------------
+
+PATCH_LIST = "hookshot_code_patches.txt"   # (in the game folder, beside the build: host/hl_patched.c reads it at start)
+
+
+def patched_functions(ranges, image_dir, say=print):
+    """What the patches touch, in guest addresses after relocation (the image's module bases: image_dir/image.json), and the guest
+    functions that contain them (the lift's function table, image_dir/functions.json: a function runs from its first instruction for
+    as many instructions as the lift counted). Returns (text of the list file, {function address as 8 hex digits: mod name}).
+    Also says when a patch lands in a function the OS layer answers itself (an HLE hook of the image): the patch has no effect there"""
+    import bisect
+    with open(os.path.join(image_dir, "image.json"), encoding="utf-8") as f:
+        meta = json.load(f)
+    bases = {m["name"]: m["base"] for m in meta["modules"]}
+    with open(os.path.join(image_dir, "functions.json"), encoding="utf-8") as f:
+        table = json.load(f)
+    starts = sorted(int(k, 16) for k in table)
+    hooks = {h["addr"]: h.get("sym") or h.get("c") for h in meta.get("hooks", [])}
+    lines = ["# code patches (exeFS mods) of this build, in guest addresses after relocation: what the engine's native answers must leave to the "
+             "lifted code (host/hl_patched.c)"]
+    funcs = {}
+    for module, runs in sorted(ranges.items()):
+        if module not in bases:
+            continue
+        for lo, hi, mod in sorted(runs):
+            g_lo, g_hi = bases[module] + lo, bases[module] + hi
+            lines.append("range 0x%x 0x%x %s %s" % (g_lo, g_hi, module, mod))
+            at = bisect.bisect_right(starts, g_lo) - 1
+            for i in range(max(0, at - 8), len(starts)):
+                a = starts[i]
+                if a >= g_hi:
+                    break
+                end = a + 4 * table["%08x" % a][0]
+                if end > g_lo and a < g_hi:
+                    funcs.setdefault("%08x" % a, (a, end, mod))
+    for key, (a, end, mod) in sorted(funcs.items()):
+        lines.append("function 0x%x 0x%x %s" % (a, end, mod))
+        if a in hooks:
+            say("code mods: %s patches the function at 0x%x, which the OS layer answers itself (%s): the patch has no effect there" %
+                (mod, a, hooks[a]))
+    return "\n".join(lines) + "\n", {k: v[2] for k, v in funcs.items()}
