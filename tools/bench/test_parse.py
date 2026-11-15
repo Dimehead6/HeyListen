@@ -11,13 +11,16 @@ import run_bench as rb  # noqa: E402
 
 DATA = Path(__file__).parent / "testdata"
 SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
+MESA_VERSION, AMDGPU_CARDS = rb.mesa_version, rb.amdgpu_cards   # (the real ones; the fixture below replaces them)
 
 
 @pytest.fixture(autouse=True)
 def _own_machine(tmp_path, monkeypatch):
-    """No test touches the user's saves (the guard copies and puts back the real data folder otherwise): the data
-    folder is the test's own."""
+    """No test touches the user's saves (the guard copies and puts back the real data folder otherwise), starts
+    vulkaninfo or reads the real GPU: the data folder is the test's own, Mesa unknown, no amdgpu card."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(rb, "mesa_version", lambda: None)
+    monkeypatch.setattr(rb, "amdgpu_cards", lambda sys_root=None: [])
 
 
 def test_percentile_and_stats():
@@ -133,7 +136,7 @@ def test_end_to_end_with_fake_hookshot(tmp_path):
                   "--out", str(out), "--duration", "2", "--warmup-s", "0"])
     assert rc == 0 and time.monotonic() - t0 < 20
     data = json.loads((out / "bench.json").read_text())
-    assert data["schema_version"] == 3 and data["frames"] > 20
+    assert data["schema_version"] == 4 and data["frames"] > 20
     assert data["fps_1pct_low"] == pytest.approx(100.0) and data["fps_0_1pct_low"] == pytest.approx(100.0)
     assert data["frame_time_ms"]["p50"] == 10.0 and data["killed_by_harness"]
     # The fake game's return_ns is not the perf_counter clock, so the offset falls back
@@ -407,3 +410,99 @@ def test_run_puts_every_save_folder_back(tmp_path):
     assert (beside / "old").read_text(encoding="utf-8") == "kept beside"
     assert sorted(p.name for p in (out / "save-guard").iterdir()) == ["0", "0.txt", "1", "1.txt"]
 
+
+# ------------------------------------------------------ the machine: environment and GPU busy (Linux)
+def _fake_sys(root: Path) -> Path:
+    for cpu, gov in (("cpu0", "performance"), ("cpu1", "performance"), ("cpu2", "powersave")):
+        (root / "devices/system/cpu" / cpu / "cpufreq").mkdir(parents=True)
+        (root / "devices/system/cpu" / cpu / "cpufreq/scaling_governor").write_text(gov + "\n")
+    thp = root / "kernel/mm/transparent_hugepage"
+    thp.mkdir(parents=True)
+    (thp / "enabled").write_text("always [madvise] never\n")
+    (thp / "shmem_enabled").write_text("always within_size [advise] never deny force\n")
+    (root / "module/udmabuf/parameters").mkdir(parents=True)
+    (root / "module/udmabuf/parameters/size_limit_mb").write_text("64\n")
+    # two cards: an amdgpu one (with a connector beside it) and another driver's; drivers and devices are links, as in sysfs
+    for name, pci, driver in (("card1", "0000:0b:00.0", "amdgpu"), ("card0", "0000:01:00.0", "i915")):
+        dev = root / "devices/pci" / pci
+        (dev).mkdir(parents=True)
+        (root / "bus/drivers" / driver).mkdir(parents=True, exist_ok=True)
+        (dev / "driver").symlink_to(root / "bus/drivers" / driver)
+        (dev / "gpu_busy_percent").write_text("37\n")
+        (root / "class/drm" / name).mkdir(parents=True)
+        (root / "class/drm" / name / "device").symlink_to(dev)
+    (root / "class/drm/card1-DP-1").mkdir()
+    (root / "class/drm/card1-DP-1/device").symlink_to(root / "class/drm/card1")
+    return root
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux sysfs")
+def test_linux_environment_from_sysfs(tmp_path):
+    sysr = _fake_sys(tmp_path / "sys")
+    proc = tmp_path / "proc"
+    (proc / "sys/kernel").mkdir(parents=True)
+    (proc / "loadavg").write_text("1.50 0.75 0.25 2/900 12345\n")
+    (proc / "sys/kernel/osrelease").write_text("6.17.1-test\n")
+    env = rb.linux_environment(sysr, proc, mesa=lambda: "Mesa 25.2.4")
+    assert env == {"cpu_governor": "performance,powersave", "thp_enabled": "madvise", "thp_shmem_enabled": "advise",
+                   "udmabuf_size_limit_mb": 64, "loadavg_start": [1.5, 0.75, 0.25], "kernel": "6.17.1-test",
+                   "mesa": "Mesa 25.2.4"}
+    # (udmabuf not loaded, no THP, no cpufreq: unknown, not an error)
+    empty = rb.linux_environment(tmp_path / "nosys", tmp_path / "noproc", mesa=lambda: None)
+    assert empty == {"cpu_governor": None, "thp_enabled": None, "thp_shmem_enabled": None, "udmabuf_size_limit_mb": None,
+                     "loadavg_start": None, "kernel": None, "mesa": None}
+
+
+def test_mesa_version_from_vulkaninfo(monkeypatch):
+    summary = ("Devices:\n========\nGPU0:\n\tdeviceName = AMD Radeon RX 9070 XT (RADV GFX1201)\n\tdriverName = radv\n"
+               "\tdriverInfo = Mesa 25.2.4-arch1.1\nGPU1:\n\tdeviceName = llvmpipe (LLVM 20.1.8, 256 bits)\n"
+               "\tdriverName = llvmpipe\n\tdriverInfo = Mesa 25.2.4-arch1.1 (LLVM 20.1.8)\n")
+    monkeypatch.setattr(rb.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(rb.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, summary, ""))
+    assert MESA_VERSION() == "Mesa 25.2.4-arch1.1"
+    monkeypatch.setattr(rb.shutil, "which", lambda name: None)
+    assert MESA_VERSION() is None
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux sysfs")
+def test_gpu_busy_reads_the_amdgpu_card_only(tmp_path):
+    sysr = _fake_sys(tmp_path / "sys")
+    cards = AMDGPU_CARDS(sysr)
+    assert [c[0] for c in cards] == ["0000:0b:00.0"]
+    busy = rb.GpuBusy(cards)
+    f = cards[0][1]
+    for t, v in ((0.5, 99), (10.0, 20), (10.2, 40), (10.4, 60)):
+        f.write_text(f"{v}\n")
+        busy.sample(t)
+    s = busy.summary(10.0)   # (the warm-up's samples left out)
+    assert s["source"] == "amdgpu gpu_busy_percent" and s["from_s_after_launch"] == 10.0
+    assert s["cards"] == [{"pci": "0000:0b:00.0", "samples": 3, "mean_pct": 40.0, "p50_pct": 40.0, "p95_pct": 58.0}]
+    busy.write_csv(tmp_path / "gpu_busy.csv")
+    assert (tmp_path / "gpu_busy.csv").read_text().splitlines()[:2] == ["t_s,pci,busy_pct", "0.500,0000:0b:00.0,99"]
+    assert rb.GpuBusy([]).summary(0.0) is None
+
+
+def test_summarize_environment_table(tmp_path, capsys):
+    import summarize as sm
+    d = tmp_path / "hookshot-linux"
+    d.mkdir()
+    _write_trace(d / "present_trace.csv", [8.0] * 50)
+    (d / "bench.json").write_text(json.dumps({
+        "build": "hookshot", "scene": "kokiri-idle", "schema_version": 4, "warmup_s": 0.0,
+        "environment": {"cpu_governor": "performance", "thp_enabled": "always", "thp_shmem_enabled": "advise",
+                        "udmabuf_size_limit_mb": 2147483647, "loadavg_start": [1.5, 0.75, 0.25],
+                        "kernel": "6.17.1", "mesa": "Mesa 25.2.4"},
+        "gpu_busy": {"source": "amdgpu gpu_busy_percent", "from_s_after_launch": 0.0,
+                     "cards": [{"pci": "0000:0b:00.0", "samples": 3, "mean_pct": 40.0, "p50_pct": 40.0, "p95_pct": 58.0}]}}))
+    old = tmp_path / "hookshot-old"
+    old.mkdir()
+    _write_trace(old / "present_trace.csv", [8.0] * 50)
+    assert sm.main([str(d), str(old)]) == 0
+    out = capsys.readouterr().out
+    assert "| Dir | Governor | THP |" in out
+    assert ("| hookshot-linux | performance | always | advise | 2147483647 | 1.50 0.75 0.25 | 6.17.1 | Mesa 25.2.4 "
+            "| 40% / 58% |") in out
+    assert "| hookshot-old | - | - | - | - | - | - | - | - |" in out
+    # (no directory records the machine: the table alone, as before)
+    assert sm.main([str(old)]) == 0
+    assert "Governor" not in capsys.readouterr().out

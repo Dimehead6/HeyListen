@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 3  # v3: fps_1pct_low, fps_0_1pct_low, over_*_ms_pct (TICK-013); v2: warmup_origin, launch_offset_s
+SCHEMA_VERSION = 4  # v4: environment, gpu_busy (Linux); v3: fps_1pct_low, fps_0_1pct_low, over_*_ms_pct (TICK-013); v2: warmup_origin, launch_offset_s
 HARD_LIMIT_S = float(os.environ.get("HL_BENCH_LIMIT_S", "120"))   # (a run is killed at 2 minutes; the owner lifted it to 8 for single long runs: HL_BENCH_LIMIT_S=500)
 DEFAULT_DURATION_S = 90.0
 # Hookshot, measured on the TICK-004 traces (see README "Warm-up"): gameplay starts
@@ -292,6 +292,112 @@ def fps_spread(fps_values: list[float]) -> dict:
             "within_limit": len(vals) > 1 and spread <= REPEAT_SPREAD_LIMIT_PCT}
 
 
+# ------------------------------------------------------- the machine (Linux)
+# What changes a Linux result beside the build (bench.json schema 4): the CPU governor, transparent huge pages (the guest
+# memory is shared memory, so shmem_enabled counts too), udmabuf's size limit (the guest memory imported as dma-bufs,
+# engine/gpu/vk/vk_memory.cpp), the load when the run starts, the kernel and Mesa; and the GPU's busy share during the
+# run, from amdgpu's sysfs file (there is no NVIDIA reader: null there).
+def _read(path: Path) -> str | None:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def _selected(text: str | None) -> str | None:
+    """The [chosen] word of a sysfs choice file ("always [madvise] never" -> "madvise")."""
+    m = re.search(r"\[([^\]]+)\]", text or "")
+    return m.group(1) if m else text
+
+
+def mesa_version() -> str | None:
+    """The Vulkan drivers' Mesa versions ("Mesa 25.2.4"), from vulkaninfo --summary when it is installed (software
+    renderers left out); None without it."""
+    exe = shutil.which("vulkaninfo")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "--summary"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found, name = [], None
+    for line in r.stdout.splitlines():
+        k, _, v = (x.strip() for x in line.partition("="))
+        if k == "driverName":
+            name = v
+        elif k == "driverInfo" and v.startswith("Mesa") and name != "llvmpipe" and v not in found:
+            found.append(v)
+    return ", ".join(found) or None
+
+
+def linux_environment(sys_root: Path = Path("/sys"), proc: Path = Path("/proc"), mesa=None) -> dict | None:
+    """The machine's state that changes Linux results, read before the launch; None on another OS."""
+    if not sys.platform.startswith("linux"):
+        return None
+    cpus = sys_root / "devices" / "system" / "cpu"
+    governors = sorted({g for g in (_read(f) for f in cpus.glob("cpu[0-9]*/cpufreq/scaling_governor")) if g})
+    thp = sys_root / "kernel" / "mm" / "transparent_hugepage"
+    udmabuf = _read(sys_root / "module" / "udmabuf" / "parameters" / "size_limit_mb")
+    load = (_read(proc / "loadavg") or "").split()[:3]
+    try:
+        loadavg = [float(x) for x in load] if len(load) == 3 else None
+    except ValueError:
+        loadavg = None
+    return {
+        "cpu_governor": ",".join(governors) or None,
+        "thp_enabled": _selected(_read(thp / "enabled")),
+        "thp_shmem_enabled": _selected(_read(thp / "shmem_enabled")),
+        "udmabuf_size_limit_mb": int(udmabuf) if udmabuf and udmabuf.isdigit() else None,
+        "loadavg_start": loadavg,
+        "kernel": _read(proc / "sys" / "kernel" / "osrelease"),
+        "mesa": (mesa or mesa_version)(),
+    }
+
+
+def amdgpu_cards(sys_root: Path = Path("/sys")) -> list[tuple[str, Path]]:
+    """(PCI address, gpu_busy_percent file) of every card whose driver is amdgpu (connectors such as card1-DP-1 left out)."""
+    cards = []
+    for card in sorted((sys_root / "class" / "drm").glob("card*")):
+        if not re.fullmatch(r"card\d+", card.name):
+            continue
+        dev = card / "device"
+        busy = dev / "gpu_busy_percent"
+        if os.path.basename(os.path.realpath(dev / "driver")) == "amdgpu" and busy.is_file():
+            cards.append((os.path.basename(os.path.realpath(dev)), busy))
+    return cards
+
+
+class GpuBusy:
+    """The amdgpu cards' busy percent, read each time sample() is called (the run's 0.2 s loop)."""
+
+    def __init__(self, cards: list[tuple[str, Path]]):
+        self.cards = cards
+        self.rows: list[tuple[float, str, int]] = []   # (seconds after the launch, PCI address, percent)
+
+    def sample(self, t_s: float) -> None:
+        for pci, f in self.cards:
+            v = _read(f)
+            if v and v.isdigit():
+                self.rows.append((t_s, pci, int(v)))
+
+    def write_csv(self, path: Path) -> None:
+        if self.cards:
+            path.write_text("t_s,pci,busy_pct\n" + "".join(f"{t:.3f},{c},{v}\n" for t, c, v in self.rows), encoding="utf-8")
+
+    def summary(self, from_s: float) -> dict | None:
+        """Per card, the samples from from_s seconds after the launch (the warm-up) on: count, mean, p50, p95."""
+        if not self.cards:
+            return None
+        cards = []
+        for pci, _f in self.cards:
+            vals = sorted(float(v) for t, c, v in self.rows if c == pci and t >= from_s)
+            cards.append({"pci": pci, "samples": len(vals),
+                          "mean_pct": round(sum(vals) / len(vals), 1) if vals else None,
+                          "p50_pct": round(percentile(vals, 0.50), 1) if vals else None,
+                          "p95_pct": round(percentile(vals, 0.95), 1) if vals else None})
+        return {"source": "amdgpu gpu_busy_percent", "from_s_after_launch": from_s, "cards": cards}
+
+
 # ------------------------------------------------------------------ watchdog
 def kill_tree(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
@@ -428,6 +534,8 @@ def run(args: argparse.Namespace) -> dict:
     image = exe.name
     if instances(exe):
         raise SystemExit(f"{exe} is already running: refusing to start a second instance of this game folder")
+    environment = linux_environment()   # (before the launch: the load average is the machine's, not the game's)
+    busy = GpuBusy(amdgpu_cards() if sys.platform.startswith("linux") else [])
     # (2026-11-09: a scripted walk left the area, the game autosaved and the user's own save was overwritten) the run must leave
     # the saves exactly as they were: copied before, put back after
     # (every folder the game may save to: on Linux the data folder and, after a failed move, user/ beside the exe)
@@ -449,6 +557,7 @@ def run(args: argparse.Namespace) -> dict:
                 next_check = time.monotonic() + 0.5
                 if trace_has_row(trace):
                     first_seen_ns = time.perf_counter_ns()
+            busy.sample(time.monotonic() - started)
             time.sleep(0.2)
         exit_code = game.poll()
     finally:
@@ -515,8 +624,11 @@ def run(args: argparse.Namespace) -> dict:
         "exit_code": exit_code,
         **compute_stats(window(rows, skip)),
         "log_window_fps": windows,
+        "environment": environment,
+        "gpu_busy": busy.summary(warmup),
         "warnings": warnings,
     }
+    busy.write_csv(out / "gpu_busy.csv")
     if rows and not result["frames"]:
         result["warnings"].append(f"no frames after the {warmup:g} s warm-up")
     (out / "bench.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
