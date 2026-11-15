@@ -220,7 +220,7 @@ def apply(gen, host=HOST, quiet=False):
         out, status = apply_text(s, want, steps)
         for addr, st in status.items():
             found[addr] = st
-            if not quiet:
+            if not quiet or st.startswith("NOT gated"):   # (a gate left out is always said: a code mod changed that function's text)
                 print("hl_gates: f_%s in %s: %s" % (addr, os.path.basename(path), st))
         if out != s:
             with open(path, "w", encoding="utf-8", newline="") as f:

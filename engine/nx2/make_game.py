@@ -1056,6 +1056,28 @@ def shader_census_cmd(romfs, out):
     return PY + [os.path.join(HERE, "shader_census.py"), romfs, "--out", out]
 
 
+def apply_code_mods(a, out, exefs):
+    """The exeFS mods of the game folder's mods folder (nx2/exefs_mods.py) patched into the work copy of the game's modules, when the
+    builder's "Code mods" option is on (--code-mods on|off; left out, what the last build of this folder chose, so that the game's
+    update keeps it). Only the work copy changes, never the kept one (.hookshot_exefs): the lift key hashes these bytes, so a patched
+    game is translated again and one without patches keeps the key it always had"""
+    import exefs_mods
+    choice = getattr(a, "code_mods", None)
+    if choice is not None:
+        exefs_mods.write_state(out, choice == "on")
+    if not exefs_mods.read_state(out):
+        return
+    try:
+        done = exefs_mods.apply_mods(exefs, exefs_mods.mods_root(out), say=lambda t: print(t, flush=True))
+    except exefs_mods.PatchError as e:
+        fail("A code mod was refused: %s" % e)
+    if done:
+        print("code mods: %d patch file(s) applied: the game is translated again from the patched code (a native-engine gate on a "
+              "function whose text changed is left out: the build log says \"NOT gated\" for it)" % len(done), flush=True)
+    else:
+        print("code mods: on, and no code patch in the mods folder", flush=True)
+
+
 LIFT_KEY = ".lift_key"   # (in <work>/sa/gen: what the lifted C there was made from)
 
 
@@ -1212,6 +1234,9 @@ def parse_args():
     p.add_argument("--update", help="a game folder built before: built again from the game files it keeps (the game's update offer)")
     p.add_argument("--no-prepare-shaders", action="store_true",
                    help="leave the shaders' preparation to the game's first start (the builder's \"Prepare shaders now\" unticked)")
+    p.add_argument("--code-mods", choices=("on", "off"),
+                   help="apply the exeFS (code) mods of the game folder's mods folder before the translation (the builder's \"Code mods\"); "
+                        "left out: as this folder's last build chose")
     p.add_argument("--log", metavar="FILE", help="also save build output to a UTF-8 file (replaces the file if it exists)")
     # (NVIDIA DLSS, off unless asked: NVIDIA's SDK into HOOKSHOT_NGX_SDK first, under NVIDIA's license. scripts/ngx_sdk.py)
     p.add_argument("--fetch-ngx-sdk", action="store_true", help="download NVIDIA's DLSS SDK into HOOKSHOT_NGX_SDK before the build")
@@ -1325,6 +1350,7 @@ def main(a=None):
         shutil.rmtree(kept, ignore_errors=True)
         shutil.copytree(exefs, kept)
     check_supported_build(exefs)
+    apply_code_mods(a, out, exefs)
 
     # (made once on the development PC: lists of addresses and counts, no game code)
     for name in ("hot_funcs.txt", "hot_order.txt", "hookshot_pieces.prof", "hookshot.res"):
