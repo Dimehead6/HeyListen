@@ -5314,6 +5314,7 @@ bool memory_rb_refresh(VkCommandBuffer up) {
 }
 
 bool memory_pool_mirror_on() { return pool_mirror_on(); }
+bool pools_mirrored() { return mirror_on(); }
 BufferRef gpu_buffer(uint64_t gpu, uint64_t size, int use) {
     uint64_t avail = 0;
     if (!host->gpu_ptr(gpu, &avail) || avail < size) return {};

@@ -116,6 +116,7 @@ void memory_sync();                                   // (at each submit: pools 
 /// (RX_VK_POOL_MIRROR: what the buffer is for: a texel view read or written, or the GPU unswizzle, which has a CPU path)
 enum { kGpuBufferRead, kGpuBufferWritten, kGpuBufferUnswizzle };
 bool memory_pool_mirror_on();   // (RX_VK_POOL_MIRROR)
+bool pools_mirrored();   // (vk_memory.cpp mirror_on: the buffer pools have VRAM mirrors, the discrete GPUs by default)
 BufferRef gpu_buffer(uint64_t gpu, uint64_t size, int use = kGpuBufferRead);   // (empty when no pool holds the range)
 /// A range as a binding of the replay sees it: the pool's VRAM mirror when it has one (vk_memory.cpp), else the
 /// imported pool. written: the GPU may write it (copied back to guest memory at the submission's end).
