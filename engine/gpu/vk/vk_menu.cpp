@@ -621,6 +621,9 @@ Row rows[] = {
     {TAB_GAMEPLAY, "Microphone", &opts.mic, 0, 2 + kMaxMics, 1, tx_mic,
      "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming).", hn_mic, false,
      true},
+    {TAB_GAMEPLAY, "Skip title screen", &opts.skip_title, 0, 1, 1, tx_onoff,   // (HL_OPT_SKIP_TITLE, vk_opt_ids.h, host/oot_autoload.c)
+     "Starts a launch with the most recent saved game: presses through the title screen and its file list. Does nothing "
+     "until the game has a save. Applies after a restart.", nullptr, true, true},
     {TAB_GAMEPLAY, "Discord status", &opts.discord, 0, 1, 1, tx_onoff,
      "Shows \"Playing Hookshot\" and the time played in your Discord status, while Discord runs on this PC.", nullptr, false,
      true},
