@@ -2728,12 +2728,23 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
         if ((int)open + 1 >= nplan || q.work < plan[open] || q.p == jobs[open]->g.p) return;
         Job* j = jobs[open].get();
         j->g.end = q.p;
+        // (stream R4, RX_VK_EARLY_AFFINITY=1: the segment's place goes to the same worker in every command buffer, as TICK-052's
+        // RX_VK_PARALLEL_AFFINITY does on the other path: a worker then records about the same draws frame after frame, and what its
+        // thread keeps (views by handle, the programs' texture slots, picks, pipelines) and its core's caches hold them; the first idle
+        // worker took the next segment, and its draws went through those cold. The replay thread still records the last one)
+        static const bool affinity = [] {
+            const char* e = getenv("RX_VK_EARLY_AFFINITY");
+            const bool v = e && atoi(e) != 0;
+            logf("vk: early segments: a place goes to %s (RX_VK_EARLY_AFFINITY)", v ? "the same worker every command buffer" : "the first idle worker");
+            return v;
+        }();
         {
             std::lock_guard lk(par_pool.mu);
-            par_pool.jobs.push_back([j, &record_job] { record_job(j); });
+            (affinity ? par_pool.own[open % (size_t)std::clamp(par_threads(), 1, 8)] : par_pool.jobs).push_back([j, &record_job] { record_job(j); });
             par_pool.pending++;
         }
-        par_pool.cv.notify_one();
+        if (affinity) par_pool.cv.notify_all();   // (the worker it is for, not whichever wakes)
+        else par_pool.cv.notify_one();
         jt_mark(26, open);
         Job* n = jobs[++open].get();
         n->s = q.s;
