@@ -2016,16 +2016,17 @@ struct ClaimJob {
     // (TICK-061, E3: other work cut the same way: fn(ctx, i0, i1) for each chunk instead of copy_part; null: the copy)
     void (*fn)(void* ctx, int64_t i0, int64_t i1) = nullptr;
     void* ctx = nullptr;
-    // (stream R4, RX_VK_CLAIM_HASH: the copy's chunk hashes, as CopyPart's: a claimed copy made none, and the mirror syncs' chunk diff hashed
-    // every page again on the replay thread, ~3.7 ms of a frame's 5.4 ms pre-sync on the PC 3050)
+    // (stream R4, RX_VK_CLAIM_HASH: the copy's chunk hashes, as CopyPart's. A claimed copy made none (RX_VK_CAPTURE_CLAIM went on by default
+    // after TICK-060's hashing copy), and the mirror syncs' chunk diff hashed every page again on the replay thread: 3.7 ms of a
+    // frame's 5.4 ms pre-sync on the PC 3050, whose link is slow enough for the diff to be on)
     uint64_t* hash = nullptr;
     uint8_t* hok = nullptr;
 };
 bool claim_hash_on() {
     static const bool on = [] {
         const char* e = getenv("RX_VK_CLAIM_HASH");
-        const bool v = e && atoi(e) != 0;
-        if (v) logf("vk: a claimed capture copy makes the chunk hashes too (RX_VK_CLAIM_HASH)");
+        const bool v = !e || atoi(e) != 0;   // (on by default: PC 3050, castle-move, 3 against 3: 31.6 -> 36.1 fps; =0: as before)
+        if (v && capture_hash_on()) logf("vk: a claimed capture copy makes the chunk hashes too (RX_VK_CLAIM_HASH)");
         return v;
     }();
     return on;
