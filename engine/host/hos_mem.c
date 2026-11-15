@@ -340,7 +340,11 @@ static void pages_report_locked(void) {
    from 32 GB. HOS_MEMINFO_OLD=0 / 1 decides either way */
 static int meminfo_old_default(void) {
     const char *e = getenv("HOS_MEMINFO_OLD");
-    if (e && e[0]) return e[0] != '0';
+    if (e && e[0]) {
+        const int old = e[0] != '0';
+        hos_log("mem: used memory report: %s, forced by HOS_MEMINFO_OLD=%s", old ? "OFF (as before #324)" : "ON (#324)", e);
+        return old;
+    }
     uint64_t ram = 0;
 #ifdef _WIN32
     MEMORYSTATUSEX m = {sizeof m};
@@ -350,8 +354,9 @@ static int meminfo_old_default(void) {
     if (pages > 0 && size > 0) ram = (uint64_t)pages * (uint64_t)size;
 #endif
     const int old = ram >= (31ULL << 30);   /* (a "32 GB" PC reports a little under 32 GB) */
-    hos_log("mem: the game is told %s (%llu MB of RAM; HOS_MEMINFO_OLD=0/1 decides)",
-            old ? "its program's memory only, as before #324" : "its heap and mapped pages too (#324)",
+    hos_log("mem: used memory report: %s, chosen by this PC's RAM (%llu MB; on under 32 GB, off from 32 GB). "
+            "HOS_MEMINFO_OLD=0 forces it on, HOS_MEMINFO_OLD=1 forces it off",
+            old ? "OFF (the program's memory only, as before #324)" : "ON (the heap and the mapped pages too, #324)",
             (unsigned long long)(ram >> 20));
     return old;
 }
