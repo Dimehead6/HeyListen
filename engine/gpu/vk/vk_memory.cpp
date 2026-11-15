@@ -2016,7 +2016,20 @@ struct ClaimJob {
     // (TICK-061, E3: other work cut the same way: fn(ctx, i0, i1) for each chunk instead of copy_part; null: the copy)
     void (*fn)(void* ctx, int64_t i0, int64_t i1) = nullptr;
     void* ctx = nullptr;
+    // (stream R4, RX_VK_CLAIM_HASH: the copy's chunk hashes, as CopyPart's: a claimed copy made none, and the mirror syncs' chunk diff hashed
+    // every page again on the replay thread, ~3.7 ms of a frame's 5.4 ms pre-sync on the PC 3050)
+    uint64_t* hash = nullptr;
+    uint8_t* hok = nullptr;
 };
+bool claim_hash_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_CLAIM_HASH");
+        const bool v = e && atoi(e) != 0;
+        if (v) logf("vk: a claimed capture copy makes the chunk hashes too (RX_VK_CLAIM_HASH)");
+        return v;
+    }();
+    return on;
+}
 bool capture_claim_on() {
     static const bool on = [] {
         const char* e = getenv("RX_VK_CAPTURE_CLAIM");
@@ -2037,7 +2050,11 @@ void claim_run(ClaimJob& j) {
         const int64_t i0 = j.next.fetch_add(j.chunk, std::memory_order_relaxed);
         if (i0 >= j.n) return;
         if (j.fn) j.fn(j.ctx, i0, std::min(i0 + j.chunk, j.n));
-        else copy_part({j.pages, i0, std::min(i0 + j.chunk, j.n), j.out, j.ok});
+        else {
+            CopyPart w{j.pages, i0, std::min(i0 + j.chunk, j.n), j.out, j.ok};
+            w.hash = j.hash, w.hok = j.hok;
+            copy_part(w);
+        }
     }
 }
 void copy_helpers_start_locked();
@@ -2114,6 +2131,7 @@ void copy_pages(const uint32_t* pages, int64_t n, uint8_t* out, uint8_t* ok, uin
     const int k = helpers + 1;
     if (capture_claim_on()) {   // (TICK-061, C1: see ClaimJob)
         ClaimJob job{pages, n, out, ok, claim_chunk_pages(n, k)};
+        if (claim_hash_on()) job.hash = hash, job.hok = hok;
         claim_all(job, helpers);
         st_claim_copies.fetch_add(1, std::memory_order_relaxed);
         return;
