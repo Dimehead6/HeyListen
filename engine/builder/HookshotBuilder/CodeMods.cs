@@ -15,8 +15,8 @@ static class CodeMods
 {
     /// What the rebuild costs, said before it starts (measured on a Ryzen 7 7800X3D, 14 build workers; slower PCs take longer)
     public const string RebuildAbout =
-        "The whole game is translated to PC code again, then only the changed parts are compiled: about as long as a game update " +
-        "(the time is on the build screen). Taking a code mod out later costs the same.";
+        "The whole game is translated to PC code again, then only the changed parts are compiled: about 15 minutes on a fast PC " +
+        "(measured: 9 minutes of translation, 6 of compiling), more on a slower one; the build screen shows the time. Taking a code mod out later costs the same.";
 
     public const string Risk =
         "Code patches change the game's own instructions. They can crash the game, corrupt a save or stop working after a game update: " +

@@ -1074,8 +1074,8 @@ def apply_code_mods(a, out, exefs):
     except exefs_mods.PatchError as e:
         fail("A code mod was refused: %s" % e)
     if done:
-        print("code mods: %d patch file(s) applied: the game is translated again from the patched code (a native-engine gate on a "
-              "function whose text changed is left out: the build log says \"NOT gated\" for it)" % len(done), flush=True)
+        print("code mods: %d patch file(s) applied: the game is translated again from the patched code (the native engine leaves every function "
+              "a patch touches to that code: the build log says \"NOT gated\" for each entry gate left out)" % len(done), flush=True)
     else:
         print("code mods: on, and no code patch in the mods folder", flush=True)
     return ranges
