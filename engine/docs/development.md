@@ -96,6 +96,7 @@ screen. It costs some GPU time on cards that cull quickly, so it is off unless s
 |---|---|
 | `HOS_INPUT_SCRIPT=<presses>` | Presses timed from the game's first controller read |
 | `HOS_INPUT_LIVE=<file>` | A file the test appends lines of presses to, read every 30 ms; each line's times count from when it is read. A line `!cheat <n>` sends a Cheats page action, `!synclog` logs the NVN syncs (`!dump`, `!shots`, `!rdoc` and `!flasharm` are the WebGPU renderer's) |
+| `HOS_INPUT_FROM_PLAY=1` | The script's times count from the moment play begins (the `play: began` line of the log: the player's first update) instead of the first controller read; nothing fires before. With `HL_SKIP_TITLE=1` a scene has the same inputs whatever the title and loading took |
 | `HL_SKIP_TITLE=0` or `1` | Skip title screen (the Gameplay row, saved as `skip_title_screen`; option id `HL_OPT_SKIP_TITLE`, `gpu/vk/vk_opt_ids.h`) for one run, wins over the row: A is pressed through the title and file list, from 20 s after the first controller read, every 2 s, until the player runs; with no save it does nothing |
 | `HOS_INPUT_FRAME_CLOCK=1` | The script's time runs at 60 game frames a second instead of the wall clock |
 | `HOS_INPUT_EXCLUSIVE`, `HOS_INPUT_BACKGROUND`, `HOS_INPUT_SCRIPT_BACKGROUND` (set) | As above; the last lets every device count while the window is behind another one |

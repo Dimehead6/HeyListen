@@ -245,7 +245,16 @@ static int64_t script_frame0;
 extern volatile LONG64 hos_present_count;   /* native game presents, not generated frames or HID polls */
 /* HOS_INPUT_FRAME_CLOCK=1: the existing script seconds/millisecond holds advance at 60 native frames per second.
    Live-file polling and HID diagnostics keep their wall clocks. Default/0/empty retains wall-clock scripts. */
+/* HOS_INPUT_FROM_PLAY=1 (HeyListen): the script's seconds count from the moment play begins (host/hos_main.c
+   hos_oot_play_ns: the player first runs) instead of from the first controller read, so a scene started with
+   HL_SKIP_TITLE=1 has the same inputs whatever time the title and the loading took. Nothing fires before play begins. */
+static int script_from_play;
+extern int64_t hos_oot_play_ns(void);   /* host/hos_main.c: 0 until the player has run */
 static int64_t script_elapsed_ms(int64_t now) {
+    if (script_from_play) {
+        const int64_t play = hos_oot_play_ns();
+        return play ? (now - play) / 1000000 : -((int64_t)1 << 40);
+    }
     if (!script_frame_clock) return (now - script_t0) / 1000000;
     const int64_t frames = InterlockedCompareExchange64(&hos_present_count, 0, 0) - script_frame0;
     return frames * 1000 / 60;
@@ -266,6 +275,9 @@ static void parse_script(void) {
         const char *e = getenv("HOS_INPUT_FRAME_CLOCK");
         script_frame_clock = e && atoi(e) != 0;
         if (script_frame_clock) script_frame0 = InterlockedCompareExchange64(&hos_present_count, 0, 0);
+        const char *p = getenv("HOS_INPUT_FROM_PLAY");
+        script_from_play = p && atoi(p) != 0;
+        if (script_from_play) hos_log("hid: the input script counts from the moment play begins (HOS_INPUT_FROM_PLAY)");
     }
     parse_presses(getenv("HOS_INPUT_SCRIPT"), 0, 0);
     if (npresses)
