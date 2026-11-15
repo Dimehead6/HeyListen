@@ -137,6 +137,7 @@ ARGS = {
     "tests/test_astc_bc_policy.py": ["--cxx", "g++"],
     "tests/test_drawn_page_map.py": ["--cxx", "{cxx}"],
     "tests/test_evict_reason.py": ["--cxx", "{cxx}"],
+    "tests/test_tl_time_domain.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
 }
 
 # Python packages some tests import (CI installs them; the runner itself needs none)

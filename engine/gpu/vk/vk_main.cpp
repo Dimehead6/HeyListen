@@ -23,6 +23,7 @@
 #include "vk_dlss.h"
 #include "vk_reflex.h"
 #include "vk_progress.h"
+#include "vk_tl_clock.h"   // (RX_VK_TL: the timeline's host time domain)
 
 namespace vkx {
 #define VKX_DEFINE(f) PFN_##f f;
@@ -256,6 +257,30 @@ bool create_device() {
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
     optional(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, dev.swap_mutable);   // (hookshot: the overlays, vk_imgui.cpp)
     if (getenv("RX_VK_TL") || getenv("RX_VK_TL_S")) optional(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME, dev.calibrated_ts);   // (stream R2: the timeline's GPU side)
+#ifndef _WIN32
+    // (Linux) tl_gpu_dump asks for the device's and the host clock's time (vk_tl_clock.h: CLOCK_MONOTONIC, the shim's
+    // QueryPerformanceCounter); a domain the device does not list may not be asked for, so the GPU side (and RX_VK_TL_PROBE) is off
+    if (dev.calibrated_ts) {
+        const auto domains_fn = (PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT)instance_proc()(dev.instance, "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
+        uint32_t nd = 0;
+        VkTimeDomainEXT domains[16];
+        if (domains_fn && domains_fn(dev.physical, &nd, nullptr) == VK_SUCCESS) {
+            nd = std::min<uint32_t>(nd, 16);
+            if (domains_fn(dev.physical, &nd, domains) < 0) nd = 0;
+        } else {
+            nd = 0;
+        }
+        std::string names;
+        for (uint32_t i = 0; i < nd; i++) names += std::string(i ? ", " : "") + tl_time_domain_name(domains[i]);
+        if (tl_time_domains_usable(domains, nd)) {
+            logf("vk: tl: GPU side calibrated against %s (domains: %s)", tl_time_domain_name(tl_host_time_domain()), names.c_str());
+        } else {
+            logf("vk: tl: GPU side off: the device lists no %s time domain beside DEVICE (domains: %s)", tl_time_domain_name(tl_host_time_domain()),
+                 names.empty() ? "none" : names.c_str());
+            dev.calibrated_ts = false;
+        }
+    }
+#endif
     dlss_device_extensions(want, exts);   // (hookshot: NVIDIA DLSS's, vk_dlss.cpp)
     reflex_device_extensions(want, exts);   // (hookshot: NVIDIA Reflex's, vk_reflex.cpp)
 
