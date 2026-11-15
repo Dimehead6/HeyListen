@@ -3735,8 +3735,8 @@ void texture_written(Texture* tex, const char* why) {
     if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) {   // (a parallel replay's order broken: see dry_mark_written)
         static int64_t n;
         if (n++ < 40 || n % 500 == 0)
-            logf("vk: parallel: #%u %#llx %ux%u x%u NVN %#x written in segment %llu, uploaded by the later segment %llu (%lld so)",
-                 tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->layers, tex->nvn_format,
+            logf("vk: parallel: #%u %#llx %ux%u x%u NVN %#x written (%s) in segment %llu, uploaded by the later segment %llu (%lld so)",
+                 tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->layers, tex->nvn_format, why ? why : "no reason",
                  (unsigned long long)tl_seg, (unsigned long long)tex->upload_seg, (long long)n);
     }
     vw_note(*tex);
