@@ -14,6 +14,7 @@ static SRWLOCK lock = SRWLOCK_INIT;
 #else
 #include <pthread.h>
 #include <sys/mman.h>
+#include <unistd.h>
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 #define LOCK() pthread_mutex_lock(&lock)
 #define UNLOCK() pthread_mutex_unlock(&lock)
@@ -334,9 +335,30 @@ static void pages_report_locked(void) {
    base alone with HOS_MEMINFO_OLD=1. QueryMemoryInfo below, and svc GetInfo's used memory (hos_svc.c). Never more than the
    console's total: nothing refuses AllocateMemoryPages by default (HOS_PAGES_LIMIT), and past the total the game's
    free = total - used would wrap to a huge figure and it would map without limit again */
+/* (HeyListen, owner's rule 2026-11-15) the default by the PC's RAM: on the RTX 5070 PC (64 GB) the A/B measured castle-move
+   +3% and kokiri-idle -5% with it, so it is on only where memory is short: under 32 GB of RAM (16 GB PCs, the Deck), off
+   from 32 GB. HOS_MEMINFO_OLD=0 / 1 decides either way */
+static int meminfo_old_default(void) {
+    const char *e = getenv("HOS_MEMINFO_OLD");
+    if (e && e[0]) return e[0] != '0';
+    uint64_t ram = 0;
+#ifdef _WIN32
+    MEMORYSTATUSEX m = {sizeof m};
+    if (GlobalMemoryStatusEx(&m)) ram = m.ullTotalPhys;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES), size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && size > 0) ram = (uint64_t)pages * (uint64_t)size;
+#endif
+    const int old = ram >= (31ULL << 30);   /* (a "32 GB" PC reports a little under 32 GB) */
+    hos_log("mem: the game is told %s (%llu MB of RAM; HOS_MEMINFO_OLD=0/1 decides)",
+            old ? "its program's memory only, as before #324" : "its heap and mapped pages too (#324)",
+            (unsigned long long)(ram >> 20));
+    return old;
+}
+
 uint64_t hos_used_memory(uint64_t base) {
     static int old = -1;
-    if (old < 0) old = env_on("HOS_MEMINFO_OLD");
+    if (old < 0) old = meminfo_old_default();
     if (old) return base;
     LOCK();
     const uint64_t mapped = mapped_bytes;
