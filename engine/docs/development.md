@@ -143,6 +143,7 @@ case-sensitive, and an unknown one is ignored.
 | `RX_VK_CHECKPOINTS=1` | Without the NVIDIA ones (AMD, Intel): VK_AMD_buffer_marker's markers, logged after a lost device and also once the GPU has finished none for `RX_VK_CHECKPOINTS_STALL_S` seconds (2; 0: only after the loss), so a ring that times out with no submission coming back still names the work |
 | `RX_VK_HANG_DUMP=<file>` | Every thread's stack to the file once no frame was shown for `RX_VK_HANG_SEC` seconds (20) (Windows) |
 | `RX_VK_NOOPT` (set) | Pipelines built without the driver's optimisations |
+| `RX_VK_PCACHE_FETCH_LOCK=0/1` | A pipeline cache's data is fetched (`vkGetPipelineCacheData`) only with no pipeline build under way (Intel's Windows driver crashes otherwise); the background save is put off to the next request when builds run throughout. Default: on for Intel (vendor 0x8086) under Windows, off elsewhere; `1` forces it on any GPU |
 | `RX_VK_SKIP_PROG=<prefix>,...` | Leaves out the draws of these programs (default `53509044401d78d2`; `-` leaves out none) |
 | `RX_VK_PIPE_SKIP=0` | A draw whose pipeline is not ready waits for it, instead of being left out when its targets hold an earlier frame |
 | `RX_VK_PRECOMPILE=0` or `1` | The shader preparation before the title off or on (on in builds made with `RX_RELEASE=1`, as the builders' are) |

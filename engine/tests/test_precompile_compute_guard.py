@@ -83,7 +83,9 @@ def main():
     # ci/made identities are checked at the boundary as well as inside the API spy.
     armed=arm.replace('VkPipeline made = VK_NULL_HANDLE;', 'VkPipeline made = VK_NULL_HANDLE; expected_ci=&ci; expected_out=&made;')
     assert armed != arm
-    cpp=HEAD+wrapper+'\nvoid actual_arm(Program&program,Pre*pre){pre->computes={&program};size_t i=0;'+armed+'\ncompleted=true;}\n'+r'''
+    # (the arm builds through the cache-held guard: a fetch of the cache's data is not under way; none here)
+    held='\nVkResult guarded_compute_held(VkPipelineCache c,const VkComputePipelineCreateInfo*ci,VkPipeline*pl){return guarded_compute(c,ci,pl);}\n'
+    cpp=HEAD+wrapper+held+'\nvoid actual_arm(Program&program,Pre*pre){pre->computes={&program};size_t i=0;'+armed+'\ncompleted=true;}\n'+r'''
 int main(int argc,char**argv){
  SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX|SEM_NOOPENFILEERRORBOX);
  CHECK(argc==2);int which=std::atoi(argv[1]);Program program;Pre pre;

@@ -104,6 +104,12 @@ bool pcache_save_mapped(const std::string&, std::size_t) { return false; }
 std::uint64_t pcache_private_mb() { return 0; }
 void pcache_log_save(const char*, std::size_t, std::uint64_t, std::uint64_t, std::int64_t) {}
 
+// (vk_draw.cpp PcacheFetch: on Intel the fetch waits for the builds under way; none here)
+constexpr int kFetchPollMs = 2000, kFetchPutOffs = 3, kFetchQueueMs = 10000;
+struct PcacheFetch {
+    explicit PcacheFetch(int, bool = true) {}
+    bool held() const { return true; }
+};
 #define fwrite save_fwrite
 #define MoveFileExA save_replace
 #include "pipeline_cache_save.inc"
