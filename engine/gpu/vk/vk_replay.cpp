@@ -2728,23 +2728,12 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
         if ((int)open + 1 >= nplan || q.work < plan[open] || q.p == jobs[open]->g.p) return;
         Job* j = jobs[open].get();
         j->g.end = q.p;
-        // (stream R4, RX_VK_EARLY_AFFINITY=1: the segment's place goes to the same worker in every command buffer, as TICK-052's
-        // RX_VK_PARALLEL_AFFINITY does on the other path: a worker then records about the same draws frame after frame, and what its
-        // thread keeps (views by handle, the programs' texture slots, picks, pipelines) and its core's caches hold them; the first idle
-        // worker took the next segment, and its draws went through those cold. The replay thread still records the last one)
-        static const bool affinity = [] {
-            const char* e = getenv("RX_VK_EARLY_AFFINITY");
-            const bool v = e && atoi(e) != 0;
-            logf("vk: early segments: a place goes to %s (RX_VK_EARLY_AFFINITY)", v ? "the same worker every command buffer" : "the first idle worker");
-            return v;
-        }();
         {
             std::lock_guard lk(par_pool.mu);
-            (affinity ? par_pool.own[open % (size_t)std::clamp(par_threads(), 1, 8)] : par_pool.jobs).push_back([j, &record_job] { record_job(j); });
+            par_pool.jobs.push_back([j, &record_job] { record_job(j); });
             par_pool.pending++;
         }
-        if (affinity) par_pool.cv.notify_all();   // (the worker it is for, not whichever wakes)
-        else par_pool.cv.notify_one();
+        par_pool.cv.notify_one();
         jt_mark(26, open);
         Job* n = jobs[++open].get();
         n->s = q.s;
@@ -2988,7 +2977,13 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         const int nplan = mkwvk::segment_plan::segment_count(last_total, per, recorders, kMaxBatch, one_round);
         if (nplan >= 2) {
             int64_t plan[kMaxBatch] = {};
-            mkwvk::segment_plan::balanced_targets(pk_profile[pk_this], nplan, last_total, plan);
+            static const double skew = [] {   // (stream R4, RX_VK_SEG_SKEW=<0..1>: see segment_plan.h balanced_targets; 0: equal parts, as before)
+                const char* e = getenv("RX_VK_SEG_SKEW");
+                const double v = e ? std::clamp(atof(e), 0.0, 1.0) : 0.0;
+                if (v > 0) logf("vk: early segments: later ones shorter, skew %.2f (RX_VK_SEG_SKEW)", v);
+                return v;
+            }();
+            mkwvk::segment_plan::balanced_targets(pk_profile[pk_this], nplan, last_total, plan, skew);
             int64_t total_now = 0;
             bool cut = false;
             const uint8_t* const ret = replay_handle_early(cmd, h, may_stop, nplan, plan, self_help, pk_profile[pk_this], &total_now, &cut);
