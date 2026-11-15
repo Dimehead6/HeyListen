@@ -5774,8 +5774,16 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
     reflex_submit_ends();
     tl_ev("blit-submit+");
-    vkQueueSubmit2(dev.queue, 1, &si, f.done);
+    const VkResult blit_res = vkQueueSubmit2(dev.queue, 1, &si, f.done);
     tl_ev("blit-submit-");
+    if (blit_res != VK_SUCCESS) {
+        // (the present below waits for the semaphore this submit signals: with the submit refused it would wait for good, on the
+        // presents' own queue unseen by anything that waits on the replay's queue)
+        if (blit_res == VK_ERROR_DEVICE_LOST) device_lost();
+        static int logged;
+        if (logged++ < 8) logf("vk: the present's blit submit failed (VkResult %d): this frame is not shown", (int)blit_res);
+        return;
+    }
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.pNext = reflex_present_id(nullptr);   // (NVIDIA Reflex: the frame's present id, and its present's markers)
     pi.waitSemaphoreCount = 1;
@@ -5796,6 +5804,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         res = vkQueuePresentKHR(dev.queue, &pi);
     }
     reflex_presented();
+    if (res == VK_ERROR_DEVICE_LOST) device_lost();   // (on the presents' own queue this is the first place a lost device shows)
     if (res < 0 && res != VK_ERROR_OUT_OF_DATE_KHR) {   // (a present that failed: said, a few times)
         static int logged;
         if (logged++ < 8) logf("vk: present failed (VkResult %d%s)", (int)res, dev.present_queue ? ", on the presents' own queue" : "");
