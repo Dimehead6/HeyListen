@@ -2548,7 +2548,14 @@ struct TexSlot {
     VkSampler sampler = VK_NULL_HANDLE;
     bool valid = false;
 };
-constexpr size_t kTexWays = 4;   // (the handles kept a slot)
+// (the handles kept a slot: 4; stream R4, RX_VK_TEX_WAYS=<2, 4, 8, 16, 32>: that many. A slot's handle is picked by the top bits of its hash, and
+// castle-move's frame resolved one slot in six again, a lookup of a view and a sampler each, 1 us)
+const size_t kTexWays = [] {
+    const char* e = getenv("RX_VK_TEX_WAYS");
+    const int w = e ? atoi(e) : 4;
+    return (size_t)(w >= 32 ? 32 : w >= 16 ? 16 : w >= 8 ? 8 : w >= 4 ? 4 : 2);
+}();
+const unsigned kTexWayShift = 32u - (unsigned)__builtin_ctzll(kTexWays);
 struct ProgSlots {
     uint64_t key = 0;
     std::vector<TexSlot> tex;
@@ -2890,7 +2897,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 VkImageView view = VK_NULL_HANDLE;
                 VkSampler sampler = VK_NULL_HANDLE;
                 // (a few handles a slot, by the handle's hash: a program drawn with one texture, then another, and back)
-                TexSlot* sl = slots ? &slots[tslot++ * kTexWays + ((handle * 0x9E3779B1u) >> 30) % kTexWays] : nullptr;
+                TexSlot* sl = slots ? &slots[tslot++ * kTexWays + ((handle * 0x9E3779B1u) >> kTexWayShift)] : nullptr;
                 // (the versions read before resolving: a registration after them is seen at the next draw)
                 const uint32_t version = sl ? texture_slot_version((int)(handle & 0xFFFFF)) : 0;
                 const uint32_t samp_version = sl ? sampler_slot_version((int)(handle >> 20)) : 0;
